@@ -1,81 +1,121 @@
 """
-HybridRAG - Document Chunking Pipeline
+HybridRAG - Robust Document Chunking Pipeline
 
-This module converts normalized documents from the ingestion
-pipeline into retrieval-friendly chunks.
+Converts normalized documents from the ingestion pipeline
+into validated, retrieval-friendly chunks.
 
-Supported source formats:
+Supported formats:
     - Markdown (.md)
     - Plain text (.txt)
 
-Main responsibilities:
-    1. Preserve document metadata.
-    2. Detect Markdown sections.
-    3. Split large sections into manageable chunks.
-    4. Preserve section context.
-    5. Use controlled overlap.
-    6. Validate the generated chunks.
+Pipeline:
+
+    Documents
+        ↓
+    Clean text
+        ↓
+    Markdown section detection
+        ↓
+    Natural-boundary splitting
+        ↓
+    Tiny-chunk merging
+        ↓
+    Validation
+        ↓
+    chunks.json
 """
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 
-# =========================================================
-# Configuration
-# =========================================================
+# ============================================================
+# PROJECT PATHS
+# ============================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+PROCESSED_DIR = (
+    PROJECT_ROOT
+    / "data"
+    / "processed"
+)
+
+CHUNKS_FILE = (
+    PROCESSED_DIR
+    / "chunks.json"
+)
+
+
+# ============================================================
+# CHUNK CONFIGURATION
+# ============================================================
 
 MAX_CHUNK_CHARS = 1200
 
-# Characters repeated between neighboring chunks.
 OVERLAP_CHARS = 200
 
-# Chunks smaller than this are considered too small to be
-# useful as independent retrieval units.
-MIN_CHUNK_CHARS = 80
+MIN_CHUNK_CHARS = 64
 
-# When searching for a natural boundary, don't search too
-# far away from the target chunk size.
 BOUNDARY_SEARCH_CHARS = 400
 
 
-# =========================================================
-# Text cleaning
-# =========================================================
+# ============================================================
+# MARKDOWN HEADING
+# ============================================================
 
-def clean_chunk(text: str) -> str:
+MARKDOWN_HEADING_PATTERN = re.compile(
+    r"(?m)^(#{1,6})[ \t]+(.+?)[ \t]*$"
+)
+
+
+# ============================================================
+# TEXT CLEANING
+# ============================================================
+
+def clean_text(text: str) -> str:
     """
-    Clean text while preserving meaningful line structure.
-
-    We intentionally do NOT remove all newlines because
-    technical documentation often relies on formatting,
-    lists, and code blocks.
+    Clean text while preserving technical formatting.
     """
 
     if not isinstance(text, str):
         return ""
 
     # Remove null characters.
-    text = text.replace("\x00", "")
+    text = text.replace(
+        "\x00",
+        ""
+    )
 
     # Normalize line endings.
-    text = text.replace("\r\n", "\n")
-    text = text.replace("\r", "\n")
+    text = text.replace(
+        "\r\n",
+        "\n"
+    )
+
+    text = text.replace(
+        "\r",
+        "\n"
+    )
 
     # Normalize tabs.
-    text = text.replace("\t", " ")
+    text = text.replace(
+        "\t",
+        " "
+    )
 
-    # Remove trailing spaces from lines.
+    # Remove trailing whitespace.
     text = "\n".join(
         line.rstrip()
         for line in text.splitlines()
     )
 
-    # Prevent excessive blank lines.
+    # Collapse excessive blank lines.
     text = re.sub(
         r"\n{3,}",
         "\n\n",
@@ -85,39 +125,40 @@ def clean_chunk(text: str) -> str:
     return text.strip()
 
 
-# =========================================================
-# Natural boundary detection
-# =========================================================
+# ============================================================
+# NATURAL BOUNDARY
+# ============================================================
 
 def find_best_boundary(
     text: str,
     target_position: int
 ) -> int:
     """
-    Find a natural place to end a chunk.
+    Find the best natural boundary before target_position.
 
-    Preference:
+    Priority:
 
-        1. Paragraph boundary
-        2. Line boundary
-        3. Sentence boundary
-        4. Target position
-
-    This avoids cutting documentation unnecessarily.
+        paragraph
+        line
+        sentence
+        word
+        exact position
     """
 
     search_start = max(
         0,
-        target_position - BOUNDARY_SEARCH_CHARS
+        target_position
+        - BOUNDARY_SEARCH_CHARS
     )
 
     candidate = text[
-        search_start:target_position
+        search_start:
+        target_position
     ]
 
-    # -----------------------------------------------------
-    # 1. Paragraph boundary
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # Paragraph
+    # --------------------------------------------------------
 
     paragraph_position = candidate.rfind(
         "\n\n"
@@ -131,9 +172,9 @@ def find_best_boundary(
             + 2
         )
 
-    # -----------------------------------------------------
-    # 2. Line boundary
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # Line
+    # --------------------------------------------------------
 
     line_position = candidate.rfind(
         "\n"
@@ -147,9 +188,9 @@ def find_best_boundary(
             + 1
         )
 
-    # -----------------------------------------------------
-    # 3. Sentence boundary
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # Sentence
+    # --------------------------------------------------------
 
     sentence_matches = list(
         re.finditer(
@@ -167,16 +208,32 @@ def find_best_boundary(
             + match.end()
         )
 
-    # -----------------------------------------------------
-    # 4. Last resort
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # Word
+    # --------------------------------------------------------
+
+    whitespace_matches = list(
+        re.finditer(
+            r"\s+",
+            candidate
+        )
+    )
+
+    if whitespace_matches:
+
+        match = whitespace_matches[-1]
+
+        return (
+            search_start
+            + match.end()
+        )
 
     return target_position
 
 
-# =========================================================
-# Split large text
-# =========================================================
+# ============================================================
+# SPLIT TEXT
+# ============================================================
 
 def split_large_text(
     text: str,
@@ -184,39 +241,50 @@ def split_large_text(
     overlap: int = OVERLAP_CHARS
 ) -> List[str]:
     """
-    Split a large block of text into overlapping chunks.
+    Split text into overlapping retrieval chunks.
 
-    The function tries to preserve natural boundaries rather
-    than blindly cutting every N characters.
+    Important:
+    A final fragment smaller than MIN_CHUNK_CHARS is merged
+    with the previous chunk instead of being returned alone.
     """
 
-    text = clean_chunk(text)
+    text = clean_text(
+        text
+    )
 
     if not text:
         return []
 
     if max_chars <= 0:
+
         raise ValueError(
             "max_chars must be greater than zero."
         )
 
     if overlap < 0:
+
         raise ValueError(
             "overlap cannot be negative."
         )
 
     if overlap >= max_chars:
+
         raise ValueError(
             "overlap must be smaller than max_chars."
         )
 
-    # Small text does not need splitting.
+    # --------------------------------------------------------
+    # Small text
+    # --------------------------------------------------------
+
     if len(text) <= max_chars:
+
         return [text]
 
     chunks: List[str] = []
 
     start = 0
+
     text_length = len(text)
 
     while start < text_length:
@@ -226,30 +294,54 @@ def split_large_text(
             text_length
         )
 
-        # -------------------------------------------------
+        # ----------------------------------------------------
         # Final chunk
-        # -------------------------------------------------
+        # ----------------------------------------------------
 
         if target_end >= text_length:
 
-            final_chunk = text[start:].strip()
+            final_chunk = text[
+                start:
+            ].strip()
 
-            if final_chunk:
-                chunks.append(final_chunk)
+            if not final_chunk:
+                break
+
+            # If final fragment is tiny, merge it into the
+            # previous chunk rather than returning it alone.
+            if (
+                len(final_chunk)
+                < MIN_CHUNK_CHARS
+                and chunks
+            ):
+
+                merged = (
+                    chunks[-1].rstrip()
+                    + "\n\n"
+                    + final_chunk.lstrip()
+                ).strip()
+
+                chunks[-1] = merged
+
+            else:
+
+                chunks.append(
+                    final_chunk
+                )
 
             break
 
-        # -------------------------------------------------
-        # Find natural boundary
-        # -------------------------------------------------
+        # ----------------------------------------------------
+        # Natural boundary
+        # ----------------------------------------------------
 
         end = find_best_boundary(
             text,
             target_end
         )
 
-        # Safety check.
         if end <= start:
+
             end = target_end
 
         chunk = text[
@@ -257,16 +349,19 @@ def split_large_text(
         ].strip()
 
         if chunk:
-            chunks.append(chunk)
 
-        # -------------------------------------------------
-        # Calculate next starting point
-        # -------------------------------------------------
+            chunks.append(
+                chunk
+            )
+
+        # ----------------------------------------------------
+        # Overlap
+        # ----------------------------------------------------
 
         next_start = end - overlap
 
-        # Never allow infinite loops.
         if next_start <= start:
+
             next_start = end
 
         start = next_start
@@ -274,63 +369,36 @@ def split_large_text(
     return chunks
 
 
-# =========================================================
-# Markdown heading detection
-# =========================================================
-
-MARKDOWN_HEADING_PATTERN = re.compile(
-    r"(?m)^(#{1,6})\s+(.+?)\s*$"
-)
-
-
-# =========================================================
-# Markdown section extraction
-# =========================================================
+# ============================================================
+# MARKDOWN SECTION EXTRACTION
+# ============================================================
 
 def extract_markdown_sections(
     text: str
-) -> List[Dict]:
+) -> List[Dict[str, Any]]:
     """
-    Extract Markdown sections based on headings.
+    Extract Markdown sections.
 
-    Example:
-
-        # Authentication
-
-        Some text...
-
-        ## OAuth2
-
-        More text...
-
-    becomes:
-
-        [
-            {
-                "section": "Authentication",
-                "level": 1,
-                "text": "Some text..."
-            },
-            {
-                "section": "OAuth2",
-                "level": 2,
-                "text": "More text..."
-            }
-        ]
+    Text before the first heading becomes "Preamble".
     """
 
-    text = clean_chunk(text)
+    text = clean_text(
+        text
+    )
 
     if not text:
+
         return []
 
     matches = list(
-        MARKDOWN_HEADING_PATTERN.finditer(text)
+        MARKDOWN_HEADING_PATTERN.finditer(
+            text
+        )
     )
 
-    # -----------------------------------------------------
-    # No Markdown headings
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # No headings
+    # --------------------------------------------------------
 
     if not matches:
 
@@ -342,23 +410,48 @@ def extract_markdown_sections(
             }
         ]
 
-    sections: List[Dict] = []
+    sections: List[
+        Dict[str, Any]
+    ] = []
 
-    # -----------------------------------------------------
-    # Process each heading
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # Preamble
+    # --------------------------------------------------------
 
-    for index, match in enumerate(matches):
+    preamble = text[
+        :matches[0].start()
+    ].strip()
+
+    if preamble:
+
+        sections.append(
+            {
+                "section": "Preamble",
+                "level": 0,
+                "text": preamble
+            }
+        )
+
+    # --------------------------------------------------------
+    # Headings
+    # --------------------------------------------------------
+
+    for index, match in enumerate(
+        matches
+    ):
 
         level = len(
             match.group(1)
         )
 
-        heading = match.group(2).strip()
+        heading = (
+            match
+            .group(2)
+            .strip()
+        )
 
         content_start = match.end()
 
-        # Find the next heading.
         if index + 1 < len(matches):
 
             content_end = matches[
@@ -370,8 +463,12 @@ def extract_markdown_sections(
             content_end = len(text)
 
         content = text[
-            content_start:content_end
+            content_start:
+            content_end
         ].strip()
+
+        if not content:
+            continue
 
         sections.append(
             {
@@ -381,185 +478,300 @@ def extract_markdown_sections(
             }
         )
 
-    # -----------------------------------------------------
-    # Handle text before the first heading
-    # -----------------------------------------------------
-
-    first_heading_start = matches[0].start()
-
-    preamble = text[
-        :first_heading_start
-    ].strip()
-
-    if preamble:
-
-        sections.insert(
-            0,
-            {
-                "section": "Preamble",
-                "level": 0,
-                "text": preamble
-            }
-        )
-
     return sections
 
 
-# =========================================================
-# Merge small pieces
-# =========================================================
+# ============================================================
+# CREATE CHUNK
+# ============================================================
 
-def merge_small_chunks(
-    chunks: List[Dict]
-) -> List[Dict]:
+def create_chunk(
+    chunk_id: str,
+    text: str,
+    document_id: str,
+    technology: str,
+    source: str,
+    file_name: str,
+    file_type: str,
+    section: str,
+    section_level: int,
+    chunk_index: int
+) -> Dict[str, Any]:
     """
-    Prevent very small chunks from becoming independent
-    retrieval units.
+    Create a consistent chunk object.
+    """
 
-    A tiny chunk is merged into its neighboring chunk.
+    return {
+        "id": chunk_id,
 
-    This is especially useful for documentation sections
-    containing only a few characters or a short sentence.
+        "text": clean_text(
+            text
+        ),
+
+        "metadata": {
+            "document_id": document_id,
+            "technology": technology,
+            "source": source,
+            "file_name": file_name,
+            "file_type": file_type,
+            "section": section,
+            "section_level": section_level,
+            "chunk_index": chunk_index
+        }
+    }
+
+
+# ============================================================
+# MERGE TINY CHUNKS
+# ============================================================
+
+def merge_tiny_chunks(
+    chunks: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    Robustly merge tiny chunks.
+
+    Handles:
+
+        normal → tiny
+        tiny → normal
+        tiny → tiny → normal
+        tiny → tiny → tiny
+        tiny at document end
+
+    We never silently discard source text.
     """
 
     if not chunks:
+
         return []
 
-    result: List[Dict] = []
+    result: List[
+        Dict[str, Any]
+    ] = []
 
-    for current in chunks:
+    tiny_buffer: List[
+        Dict[str, Any]
+    ] = []
 
-        current_text = current["text"].strip()
+    # --------------------------------------------------------
+    # First pass
+    # --------------------------------------------------------
 
-        # -------------------------------------------------
-        # Normal chunk
-        # -------------------------------------------------
+    for chunk in chunks:
 
-        if len(current_text) >= MIN_CHUNK_CHARS:
+        text = clean_text(
+            chunk.get(
+                "text",
+                ""
+            )
+        )
 
-            result.append(current)
-
+        if not text:
             continue
 
-        # -------------------------------------------------
-        # Tiny chunk
-        # -------------------------------------------------
+        chunk["text"] = text
 
-        # If there is a previous chunk, merge into it.
+        # Normal chunk.
+        if len(text) >= MIN_CHUNK_CHARS:
+
+            # Attach all preceding tiny chunks.
+            if tiny_buffer:
+
+                prefix_parts = [
+                    item["text"]
+                    for item in tiny_buffer
+                ]
+
+                prefix = "\n\n".join(
+                    prefix_parts
+                )
+
+                chunk["text"] = (
+                    prefix
+                    + "\n\n"
+                    + chunk["text"]
+                ).strip()
+
+                merged_ids = chunk[
+                    "metadata"
+                ].setdefault(
+                    "merged_chunk_ids",
+                    []
+                )
+
+                for item in tiny_buffer:
+
+                    merged_ids.append(
+                        item["id"]
+                    )
+
+                tiny_buffer.clear()
+
+            result.append(
+                chunk
+            )
+
+        # Tiny chunk.
+        else:
+
+            tiny_buffer.append(
+                chunk
+            )
+
+    # --------------------------------------------------------
+    # Remaining tiny chunks
+    # --------------------------------------------------------
+
+    if tiny_buffer:
+
+        tiny_text = "\n\n".join(
+            item["text"]
+            for item in tiny_buffer
+        )
+
+        # Best option: merge with previous chunk.
         if result:
 
             previous = result[-1]
 
-            merged_text = (
+            previous["text"] = (
                 previous["text"].rstrip()
                 + "\n\n"
-                + current_text
+                + tiny_text.lstrip()
             ).strip()
 
-            previous["text"] = merged_text
-
-            # Record merged section information.
-            existing_section = previous[
+            merged_ids = previous[
                 "metadata"
-            ].get("section", "")
+            ].setdefault(
+                "merged_chunk_ids",
+                []
+            )
 
-            current_section = current[
-                "metadata"
-            ].get("section", "")
+            for item in tiny_buffer:
 
-            if (
-                current_section
-                and current_section
-                != existing_section
-            ):
-
-                previous[
-                    "metadata"
-                ]["merged_sections"] = (
-                    previous[
-                        "metadata"
-                    ].get(
-                        "merged_sections",
-                        []
-                    )
-                    + [current_section]
+                merged_ids.append(
+                    item["id"]
                 )
 
-            continue
+        else:
 
-        # -------------------------------------------------
-        # Tiny first chunk
-        # -------------------------------------------------
+            # This means the entire section/document consists
+            # only of tiny content.
+            #
+            # Preserve it rather than silently deleting it.
+            combined = tiny_buffer[0].copy()
 
-        # Keep it temporarily. If there is no previous
-        # chunk, we cannot safely discard source content.
-        result.append(current)
+            combined["text"] = (
+                tiny_text
+            )
+
+            result.append(
+                combined
+            )
 
     return result
 
 
-# =========================================================
-# Chunk one document
-# =========================================================
+# ============================================================
+# CHUNK ONE DOCUMENT
+# ============================================================
 
 def chunk_document(
-    document: Dict
-) -> List[Dict]:
+    document: Dict[str, Any]
+) -> List[Dict[str, Any]]:
     """
-    Convert one normalized document into retrieval chunks.
+    Convert one normalized document into chunks.
     """
 
-    if not isinstance(document, dict):
+    if not isinstance(
+        document,
+        dict
+    ):
 
         raise TypeError(
             "document must be a dictionary."
         )
 
-    if "text" not in document:
-
-        raise ValueError(
-            "Document is missing 'text'."
-        )
-
-    if "metadata" not in document:
-
-        raise ValueError(
-            "Document is missing 'metadata'."
-        )
-
-    text = document["text"]
-
-    metadata = document["metadata"]
-
-    document_id = document.get(
-        "id",
-        "unknown-document"
-    )
-
-    technology = metadata.get(
-        "technology",
-        "unknown"
-    )
-
-    source = metadata.get(
-        "source",
-        "unknown"
-    )
-
-    file_type = metadata.get(
-        "file_type",
+    text = document.get(
+        "text",
         ""
-    ).lower()
+    )
 
-    if not text.strip():
+    metadata = document.get(
+        "metadata",
+        {}
+    )
+
+    if not isinstance(
+        text,
+        str
+    ):
+
+        raise ValueError(
+            "document.text must be a string."
+        )
+
+    if not isinstance(
+        metadata,
+        dict
+    ):
+
+        raise ValueError(
+            "document.metadata must be a dictionary."
+        )
+
+    text = clean_text(
+        text
+    )
+
+    if not text:
 
         return []
 
-    raw_chunks: List[Dict] = []
+    document_id = str(
+        document.get(
+            "id",
+            "unknown-document"
+        )
+    )
 
-    # =====================================================
-    # Markdown documents
-    # =====================================================
+    technology = str(
+        metadata.get(
+            "technology",
+            "unknown"
+        )
+    )
+
+    source = str(
+        metadata.get(
+            "source",
+            "unknown"
+        )
+    )
+
+    file_type = str(
+        metadata.get(
+            "file_type",
+            ""
+        )
+    ).lower()
+
+    file_name = str(
+        metadata.get(
+            "file_name"
+        )
+        or Path(source).name
+        or "unknown"
+    )
+
+    raw_chunks: List[
+        Dict[str, Any]
+    ] = []
+
+    # ========================================================
+    # MARKDOWN
+    # ========================================================
 
     if file_type == ".md":
 
@@ -571,36 +783,27 @@ def chunk_document(
             sections
         ):
 
-            section_name = section[
-                "section"
-            ]
+            section_name = str(
+                section["section"]
+            )
 
-            section_level = section[
-                "level"
-            ]
+            section_level = int(
+                section["level"]
+            )
 
-            section_text = section[
-                "text"
-            ]
+            section_text = str(
+                section["text"]
+            )
 
-            # -------------------------------------------------
-            # IMPORTANT:
-            # Include the heading in the actual chunk.
-            #
-            # This gives the embedding model context such as:
-            #
-            # "Dependencies
-            #  FastAPI provides..."
-            #
-            # instead of only:
-            #
-            # "FastAPI provides..."
-            # -------------------------------------------------
-
-            if section_name != "General":
+            # Add section context.
+            if section_name not in {
+                "General",
+                "Preamble"
+            }:
 
                 contextual_text = (
-                    f"Section: {section_name}\n\n"
+                    f"Section: "
+                    f"{section_name}\n\n"
                     f"{section_text}"
                 )
 
@@ -623,30 +826,23 @@ def chunk_document(
                 )
 
                 raw_chunks.append(
-                    {
-                        "id": chunk_id,
-
-                        "text": piece,
-
-                        "metadata": {
-                            "document_id": document_id,
-                            "technology": technology,
-                            "source": source,
-                            "file_name": metadata.get(
-                                "file_name",
-                                Path(source).name
-                            ),
-                            "file_type": file_type,
-                            "section": section_name,
-                            "section_level": section_level,
-                            "chunk_index": piece_index
-                        }
-                    }
+                    create_chunk(
+                        chunk_id=chunk_id,
+                        text=piece,
+                        document_id=document_id,
+                        technology=technology,
+                        source=source,
+                        file_name=file_name,
+                        file_type=file_type,
+                        section=section_name,
+                        section_level=section_level,
+                        chunk_index=piece_index
+                    )
                 )
 
-    # =====================================================
-    # Plain text documents
-    # =====================================================
+    # ========================================================
+    # PLAIN TEXT
+    # ========================================================
 
     elif file_type == ".txt":
 
@@ -664,64 +860,65 @@ def chunk_document(
             )
 
             raw_chunks.append(
-                {
-                    "id": chunk_id,
-
-                    "text": piece,
-
-                    "metadata": {
-                        "document_id": document_id,
-                        "technology": technology,
-                        "source": source,
-                        "file_name": metadata.get(
-                            "file_name",
-                            Path(source).name
-                        ),
-                        "file_type": file_type,
-                        "section": "General",
-                        "section_level": 0,
-                        "chunk_index": piece_index
-                    }
-                }
+                create_chunk(
+                    chunk_id=chunk_id,
+                    text=piece,
+                    document_id=document_id,
+                    technology=technology,
+                    source=source,
+                    file_name=file_name,
+                    file_type=file_type,
+                    section="General",
+                    section_level=0,
+                    chunk_index=piece_index
+                )
             )
-
-    # =====================================================
-    # Unsupported type
-    # =====================================================
 
     else:
 
         return []
 
-    # -----------------------------------------------------
-    # Merge tiny chunks
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # Robust tiny-chunk cleanup
+    # --------------------------------------------------------
 
-    return merge_small_chunks(
+    cleaned_chunks = merge_tiny_chunks(
         raw_chunks
     )
 
+    return cleaned_chunks
 
-# =========================================================
-# Chunk all documents
-# =========================================================
+
+# ============================================================
+# CHUNK ALL DOCUMENTS
+# ============================================================
 
 def chunk_documents(
-    documents: List[Dict]
-) -> List[Dict]:
+    documents: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
     """
-    Chunk every loaded document.
+    Chunk every document.
+
+    Individual document failures are reported without
+    crashing the complete process.
     """
 
-    if not isinstance(documents, list):
+    if not isinstance(
+        documents,
+        list
+    ):
 
         raise TypeError(
             "documents must be a list."
         )
 
-    all_chunks: List[Dict] = []
+    all_chunks: List[
+        Dict[str, Any]
+    ] = []
 
-    for document_index, document in enumerate(
+    failed_documents = 0
+
+    for index, document in enumerate(
         documents,
         start=1
     ):
@@ -732,62 +929,110 @@ def chunk_documents(
                 document
             )
 
-            all_chunks.extend(chunks)
+            all_chunks.extend(
+                chunks
+            )
 
         except Exception as error:
 
+            failed_documents += 1
+
             source = (
                 document
-                .get("metadata", {})
-                .get("source", "unknown")
+                .get(
+                    "metadata",
+                    {}
+                )
+                .get(
+                    "source",
+                    "unknown"
+                )
+                if isinstance(
+                    document,
+                    dict
+                )
+                else "unknown"
             )
 
             print(
-                f"[WARNING] Failed to chunk document "
-                f"{document_index}: {source}"
+                f"[WARNING] Failed document "
+                f"{index}: {source}"
             )
 
             print(
                 f"          Reason: {error}"
             )
 
+    if failed_documents:
+
+        print(
+            f"\n[WARNING] Failed documents: "
+            f"{failed_documents}"
+        )
+
     return all_chunks
 
 
-# =========================================================
-# Chunk validation
-# =========================================================
+# ============================================================
+# VALIDATION
+# ============================================================
 
 def validate_chunks(
-    chunks: List[Dict]
-) -> Dict:
+    chunks: List[Dict[str, Any]]
+) -> Dict[str, Any]:
     """
-    Validate the generated chunk collection.
-
-    Returns a dictionary containing validation statistics.
+    Validate all chunks.
     """
 
-    if not isinstance(chunks, list):
+    if not isinstance(
+        chunks,
+        list
+    ):
 
         raise TypeError(
             "chunks must be a list."
         )
 
-    total_chunks = len(chunks)
+    seen_ids = set()
+
+    duplicate_ids = []
 
     empty_chunks = []
 
     tiny_chunks = []
 
-    duplicate_ids = []
+    metadata_problems = []
 
-    missing_metadata = []
-
-    seen_ids = set()
+    oversized_chunks = []
 
     sizes = []
 
-    for chunk in chunks:
+    required_fields = [
+        "document_id",
+        "technology",
+        "source",
+        "file_name",
+        "file_type",
+        "section",
+        "section_level",
+        "chunk_index"
+    ]
+
+    for position, chunk in enumerate(
+        chunks
+    ):
+
+        if not isinstance(
+            chunk,
+            dict
+        ):
+
+            metadata_problems.append(
+                f"position {position}: "
+                f"invalid chunk object"
+            )
+
+            continue
 
         chunk_id = chunk.get(
             "id"
@@ -802,20 +1047,21 @@ def validate_chunks(
             "metadata"
         )
 
-        # -------------------------------------------------
-        # ID validation
-        # -------------------------------------------------
+        # ----------------------------------------------------
+        # ID
+        # ----------------------------------------------------
 
         if not chunk_id:
 
-            missing_metadata.append(
-                "missing chunk ID"
+            metadata_problems.append(
+                f"position {position}: "
+                f"missing ID"
             )
 
         elif chunk_id in seen_ids:
 
             duplicate_ids.append(
-                chunk_id
+                str(chunk_id)
             )
 
         else:
@@ -824,87 +1070,106 @@ def validate_chunks(
                 chunk_id
             )
 
-        # -------------------------------------------------
-        # Text validation
-        # -------------------------------------------------
+        # ----------------------------------------------------
+        # Text
+        # ----------------------------------------------------
 
-        if not text.strip():
+        if (
+            not isinstance(
+                text,
+                str
+            )
+            or not text.strip()
+        ):
 
             empty_chunks.append(
-                chunk_id
+                str(chunk_id)
             )
 
         else:
 
             size = len(text)
 
-            sizes.append(size)
+            sizes.append(
+                size
+            )
 
             if size < MIN_CHUNK_CHARS:
 
                 tiny_chunks.append(
-                    chunk_id
+                    str(chunk_id)
                 )
 
-        # -------------------------------------------------
-        # Metadata validation
-        # -------------------------------------------------
+            if size > (
+                MAX_CHUNK_CHARS
+                + MIN_CHUNK_CHARS
+            ):
+
+                oversized_chunks.append(
+                    str(chunk_id)
+                )
+
+        # ----------------------------------------------------
+        # Metadata
+        # ----------------------------------------------------
 
         if not isinstance(
             metadata,
             dict
         ):
 
-            missing_metadata.append(
-                f"{chunk_id}: metadata missing"
+            metadata_problems.append(
+                f"{chunk_id}: "
+                f"metadata missing"
             )
 
             continue
 
-        required_fields = [
-            "document_id",
-            "technology",
-            "source",
-            "file_type",
-            "section"
-        ]
-
         for field in required_fields:
 
-            if field not in metadata:
+            value = metadata.get(
+                field
+            )
 
-                missing_metadata.append(
-                    f"{chunk_id}: missing {field}"
+            if value is None or value == "":
+
+                metadata_problems.append(
+                    f"{chunk_id}: "
+                    f"missing {field}"
                 )
 
-    # -----------------------------------------------------
+    # --------------------------------------------------------
     # Statistics
-    # -----------------------------------------------------
+    # --------------------------------------------------------
 
-    if sizes:
+    smallest = (
+        min(sizes)
+        if sizes
+        else 0
+    )
 
-        smallest = min(sizes)
+    largest = (
+        max(sizes)
+        if sizes
+        else 0
+    )
 
-        largest = max(sizes)
-
-        average = (
-            sum(sizes)
-            / len(sizes)
-        )
-
-    else:
-
-        smallest = 0
-        largest = 0
-        average = 0
+    average = (
+        sum(sizes) / len(sizes)
+        if sizes
+        else 0
+    )
 
     return {
-        "total_chunks": total_chunks,
+        "total_chunks": len(chunks),
         "empty_chunks": len(empty_chunks),
         "tiny_chunks": len(tiny_chunks),
         "duplicate_ids": len(duplicate_ids),
-        "missing_metadata": len(
-            missing_metadata
+        "metadata_problems": len(
+            metadata_problems
+        ),
+        "oversized_chunks": len(
+            oversized_chunks
         ),
         "smallest_chunk": smallest,
         "largest_chunk": largest,
@@ -912,91 +1177,103 @@ def validate_chunks(
     }
 
 
-# =========================================================
-# Print statistics
-# =========================================================
+# ============================================================
+# PRINT STATISTICS
+# ============================================================
 
 def print_chunk_statistics(
-    chunks: List[Dict]
+    chunks: List[Dict[str, Any]]
 ) -> None:
-    """
-    Print human-readable chunk statistics.
-    """
-
-    print("\n" + "=" * 70)
-    print("CHUNKING SUMMARY")
-    print("=" * 70)
-
-    if not chunks:
-
-        print(
-            "Total chunks: 0"
-        )
-
-        print(
-            "[ERROR] No chunks were created."
-        )
-
-        print("=" * 70)
-
-        return
 
     validation = validate_chunks(
         chunks
     )
 
     print(
-        f"Total chunks: "
+        "\n"
+        + "=" * 70
+    )
+
+    print(
+        "CHUNKING SUMMARY"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    print(
+        f"Total chunks        : "
         f"{validation['total_chunks']:,}"
     )
 
     print(
-        f"Smallest chunk: "
+        f"Smallest chunk      : "
         f"{validation['smallest_chunk']:,} chars"
     )
 
     print(
-        f"Largest chunk: "
+        f"Largest chunk       : "
         f"{validation['largest_chunk']:,} chars"
     )
 
     print(
-        f"Average chunk: "
+        f"Average chunk       : "
         f"{validation['average_chunk']:,.0f} chars"
     )
 
     print(
-        f"Tiny chunks (< {MIN_CHUNK_CHARS}): "
+        f"Tiny chunks (< {MIN_CHUNK_CHARS}) : "
         f"{validation['tiny_chunks']:,}"
     )
 
     print(
-        f"Empty chunks: "
+        f"Empty chunks        : "
         f"{validation['empty_chunks']:,}"
     )
 
     print(
-        f"Duplicate IDs: "
+        f"Duplicate IDs       : "
         f"{validation['duplicate_ids']:,}"
     )
 
     print(
-        f"Metadata problems: "
-        f"{validation['missing_metadata']:,}"
+        f"Metadata problems   : "
+        f"{validation['metadata_problems']:,}"
     )
 
-    # -----------------------------------------------------
-    # Technology statistics
-    # -----------------------------------------------------
+    print(
+        f"Oversized chunks    : "
+        f"{validation['oversized_chunks']:,}"
+    )
 
-    technology_counts: Dict[str, int] = {}
+    # ========================================================
+    # TECHNOLOGY
+    # ========================================================
+
+    technology_counts: Dict[
+        str,
+        int
+    ] = {}
+
+    file_type_counts: Dict[
+        str,
+        int
+    ] = {}
 
     for chunk in chunks:
 
-        technology = chunk[
+        metadata = chunk[
             "metadata"
-        ].get(
+        ]
+
+        technology = metadata.get(
             "technology",
+            "unknown"
+        )
+
+        file_type = metadata.get(
+            "file_type",
             "unknown"
         )
 
@@ -1010,31 +1287,6 @@ def print_chunk_statistics(
             + 1
         )
 
-    print("\nChunks by technology:")
-
-    for technology, count in sorted(
-        technology_counts.items()
-    ):
-
-        print(
-            f"  {technology}: {count:,}"
-        )
-
-    # -----------------------------------------------------
-    # File type statistics
-    # -----------------------------------------------------
-
-    file_type_counts: Dict[str, int] = {}
-
-    for chunk in chunks:
-
-        file_type = chunk[
-            "metadata"
-        ].get(
-            "file_type",
-            "unknown"
-        )
-
         file_type_counts[
             file_type
         ] = (
@@ -1045,23 +1297,43 @@ def print_chunk_statistics(
             + 1
         )
 
-    print("\nChunks by file type:")
+    print(
+        "\nChunks by technology:"
+    )
+
+    for technology, count in sorted(
+        technology_counts.items()
+    ):
+
+        print(
+            f"  {technology:<12}: "
+            f"{count:,}"
+        )
+
+    print(
+        "\nChunks by file type:"
+    )
 
     for file_type, count in sorted(
         file_type_counts.items()
     ):
 
         print(
-            f"  {file_type}: {count:,}"
+            f"  {file_type:<12}: "
+            f"{count:,}"
         )
 
-    # -----------------------------------------------------
-    # Validation status
-    # -----------------------------------------------------
+    # ========================================================
+    # VALIDATION
+    # ========================================================
 
-    print("\nValidation:")
+    print(
+        "\nValidation:"
+    )
 
-    if validation["empty_chunks"] == 0:
+    if validation[
+        "empty_chunks"
+    ] == 0:
 
         print(
             "  [OK] No empty chunks."
@@ -1073,7 +1345,9 @@ def print_chunk_statistics(
             "  [ERROR] Empty chunks detected."
         )
 
-    if validation["duplicate_ids"] == 0:
+    if validation[
+        "duplicate_ids"
+    ] == 0:
 
         print(
             "  [OK] All chunk IDs are unique."
@@ -1085,7 +1359,9 @@ def print_chunk_statistics(
             "  [ERROR] Duplicate chunk IDs detected."
         )
 
-    if validation["missing_metadata"] == 0:
+    if validation[
+        "metadata_problems"
+    ] == 0:
 
         print(
             "  [OK] Required metadata is present."
@@ -1097,7 +1373,9 @@ def print_chunk_statistics(
             "  [ERROR] Metadata problems detected."
         )
 
-    if validation["tiny_chunks"] == 0:
+    if validation[
+        "tiny_chunks"
+    ] == 0:
 
         print(
             "  [OK] No tiny chunks."
@@ -1106,33 +1384,40 @@ def print_chunk_statistics(
     else:
 
         print(
-            "  [WARNING] Tiny chunks detected."
+            "  [ERROR] Tiny chunks detected."
         )
 
-    print("=" * 70)
+    if validation[
+        "oversized_chunks"
+    ] == 0:
+
+        print(
+            "  [OK] No unexpectedly oversized chunks."
+        )
+
+    else:
+
+        print(
+            "  [WARNING] Oversized chunks detected."
+        )
+
+    print(
+        "=" * 70
+    )
 
 
-# =========================================================
-# Display sample chunks
-# =========================================================
+# ============================================================
+# SAMPLE CHUNKS
+# ============================================================
 
 def display_sample_chunks(
-    chunks: List[Dict],
-    max_samples: int = 2
+    chunks: List[Dict[str, Any]],
+    max_samples_per_technology: int = 2
 ) -> None:
-    """
-    Display representative chunks.
 
-    Shows one or two examples from each technology.
-    """
-
-    print("\n" + "=" * 70)
-    print("SAMPLE CHUNKS")
-    print("=" * 70)
-
-    technology_samples: Dict[
+    samples: Dict[
         str,
-        List[Dict]
+        List[Dict[str, Any]]
     ] = {}
 
     for chunk in chunks:
@@ -1144,26 +1429,39 @@ def display_sample_chunks(
             "unknown"
         )
 
-        technology_samples.setdefault(
+        samples.setdefault(
             technology,
             []
         )
 
         if len(
-            technology_samples[
-                technology
-            ]
-        ) < max_samples:
+            samples[technology]
+        ) < max_samples_per_technology:
 
-            technology_samples[
+            samples[
                 technology
-            ].append(chunk)
+            ].append(
+                chunk
+            )
+
+    print(
+        "\n"
+        + "=" * 70
+    )
+
+    print(
+        "SAMPLE CHUNKS"
+    )
+
+    print(
+        "=" * 70
+    )
 
     for technology in sorted(
-        technology_samples
+        samples
     ):
 
-        for chunk in technology_samples[
+        for chunk in samples[
             technology
         ]:
 
@@ -1172,7 +1470,8 @@ def display_sample_chunks(
             ]
 
             print(
-                "\n" + "-" * 70
+                "\n"
+                + "-" * 70
             )
 
             print(
@@ -1209,33 +1508,175 @@ def display_sample_chunks(
             )
 
 
-# =========================================================
-# Main test
-# =========================================================
+# ============================================================
+# SAVE CHUNKS
+# ============================================================
 
-if __name__ == "__main__":
+def save_chunks(
+    chunks: List[Dict[str, Any]]
+) -> None:
+    """
+    Atomically save chunks.json and verify it.
+    """
 
-    # -----------------------------------------------------
-    # Determine project root
-    # -----------------------------------------------------
+    if not chunks:
 
-    PROJECT_ROOT = (
-        Path(__file__)
-        .resolve()
-        .parents[2]
-    )
-
-    # Make the project root available for imports.
-    if str(PROJECT_ROOT) not in sys.path:
-
-        sys.path.insert(
-            0,
-            str(PROJECT_ROOT)
+        raise ValueError(
+            "Cannot save zero chunks."
         )
 
-    # -----------------------------------------------------
-    # Import document loader
-    # -----------------------------------------------------
+    PROCESSED_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    temporary_file = (
+        PROCESSED_DIR
+        / "chunks.json.tmp"
+    )
+
+    try:
+
+        # ----------------------------------------------------
+        # Write temporary file
+        # ----------------------------------------------------
+
+        with temporary_file.open(
+            "w",
+            encoding="utf-8"
+        ) as file:
+
+            json.dump(
+                chunks,
+                file,
+                ensure_ascii=False,
+                indent=2
+            )
+
+            file.flush()
+
+        # ----------------------------------------------------
+        # Replace final file
+        # ----------------------------------------------------
+
+        temporary_file.replace(
+            CHUNKS_FILE
+        )
+
+    finally:
+
+        if temporary_file.exists():
+
+            temporary_file.unlink(
+                missing_ok=True
+            )
+
+    # --------------------------------------------------------
+    # Verify file
+    # --------------------------------------------------------
+
+    if not CHUNKS_FILE.exists():
+
+        raise RuntimeError(
+            "chunks.json was not created."
+        )
+
+    file_size = (
+        CHUNKS_FILE.stat().st_size
+    )
+
+    if file_size <= 0:
+
+        raise RuntimeError(
+            "chunks.json is empty."
+        )
+
+    # Read back.
+    with CHUNKS_FILE.open(
+        "r",
+        encoding="utf-8"
+    ) as file:
+
+        saved_chunks = json.load(
+            file
+        )
+
+    if not isinstance(
+        saved_chunks,
+        list
+    ):
+
+        raise RuntimeError(
+            "chunks.json does not contain a JSON list."
+        )
+
+    if len(
+        saved_chunks
+    ) != len(chunks):
+
+        raise RuntimeError(
+            "Saved chunk count does not match "
+            "generated chunk count."
+        )
+
+    print(
+        "\n"
+        + "=" * 70
+    )
+
+    print(
+        "CHUNK FILE SAVED"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    print(
+        f"File      : "
+        f"{CHUNKS_FILE}"
+    )
+
+    print(
+        f"Chunks    : "
+        f"{len(chunks):,}"
+    )
+
+    print(
+        f"File size : "
+        f"{file_size / (1024 * 1024):.2f} MB"
+    )
+
+    print(
+        "[OK] chunks.json created and verified."
+    )
+
+    print(
+        "=" * 70
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main() -> None:
+
+    print(
+        "=" * 70
+    )
+
+    print(
+        "HYBRID RAG - CHUNKING PIPELINE"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    # ========================================================
+    # IMPORT
+    # ========================================================
 
     try:
 
@@ -1246,65 +1687,21 @@ if __name__ == "__main__":
     except ImportError as error:
 
         print(
-            "[ERROR] Could not import document loader."
+            "\n[ERROR] Could not import document loader."
         )
 
         print(
             f"Reason: {error}"
         )
 
-        print(
-            "\nExpected project structure:"
-        )
+        raise SystemExit(1)
 
-        print(
-            "HybridRAG/"
-        )
-
-        print(
-            "├── data/raw/"
-        )
-
-        print(
-            "├── src/"
-        )
-
-        print(
-            "│   ├── ingestion/"
-        )
-
-        print(
-            "│   │   └── document_loader.py"
-        )
-
-        print(
-            "│   └── chunking/"
-        )
-
-        print(
-            "│       └── chunker.py"
-        )
-
-        sys.exit(1)
-
-    # -----------------------------------------------------
-    # Header
-    # -----------------------------------------------------
-
-    print("=" * 70)
+    # ========================================================
+    # STEP 1
+    # ========================================================
 
     print(
-        "HYBRID RAG - CHUNKING TEST"
-    )
-
-    print("=" * 70)
-
-    # -----------------------------------------------------
-    # Step 1: Load documents
-    # -----------------------------------------------------
-
-    print(
-        "\n[1/3] Loading documents..."
+        "\n[1/4] Loading documents..."
     )
 
     try:
@@ -1321,7 +1718,7 @@ if __name__ == "__main__":
             f"Reason: {error}"
         )
 
-        sys.exit(1)
+        raise SystemExit(1)
 
     if not documents:
 
@@ -1329,31 +1726,19 @@ if __name__ == "__main__":
             "\n[ERROR] No documents were loaded."
         )
 
-        print(
-            "Check:"
-        )
-
-        print(
-            "  data/raw/python/"
-        )
-
-        print(
-            "  data/raw/fastapi/"
-        )
-
-        sys.exit(1)
+        raise SystemExit(1)
 
     print(
         f"\nSuccessfully loaded "
         f"{len(documents):,} documents."
     )
 
-    # -----------------------------------------------------
-    # Step 2: Create chunks
-    # -----------------------------------------------------
+    # ========================================================
+    # STEP 2
+    # ========================================================
 
     print(
-        "\n[2/3] Creating chunks..."
+        "\n[2/4] Creating chunks..."
     )
 
     try:
@@ -1372,7 +1757,7 @@ if __name__ == "__main__":
             f"Reason: {error}"
         )
 
-        sys.exit(1)
+        raise SystemExit(1)
 
     if not chunks:
 
@@ -1380,71 +1765,163 @@ if __name__ == "__main__":
             "\n[ERROR] No chunks were created."
         )
 
-        sys.exit(1)
+        raise SystemExit(1)
 
     print(
         f"Successfully created "
         f"{len(chunks):,} chunks."
     )
 
-    # -----------------------------------------------------
-    # Step 3: Validate
-    # -----------------------------------------------------
+    # ========================================================
+    # STEP 3
+    # ========================================================
 
     print(
-        "\n[3/3] Validating chunks..."
+        "\n[3/4] Validating chunks..."
     )
 
     print_chunk_statistics(
         chunks
     )
 
-    # -----------------------------------------------------
-    # Samples
-    # -----------------------------------------------------
-
-    display_sample_chunks(
-        chunks,
-        max_samples=2
-    )
-
-    # -----------------------------------------------------
-    # Final status
-    # -----------------------------------------------------
-
     validation = validate_chunks(
         chunks
     )
 
-    has_critical_error = (
-        validation["empty_chunks"] > 0
-        or validation["duplicate_ids"] > 0
-        or validation["missing_metadata"] > 0
+    critical_errors = (
+        validation[
+            "empty_chunks"
+        ] > 0
+
+        or validation[
+            "duplicate_ids"
+        ] > 0
+
+        or validation[
+            "metadata_problems"
+        ] > 0
+
+        or validation[
+            "tiny_chunks"
+        ] > 0
+    )
+
+    if critical_errors:
+
+        print(
+            "\n[ERROR] Chunk validation failed."
+        )
+
+        print(
+            "chunks.json will NOT be written."
+        )
+
+        raise SystemExit(1)
+
+    display_sample_chunks(
+        chunks
+    )
+
+    # ========================================================
+    # STEP 4
+    # ========================================================
+
+    print(
+        "\n[4/4] Saving chunks..."
+    )
+
+    try:
+
+        save_chunks(
+            chunks
+        )
+
+    except Exception as error:
+
+        print(
+            "\n[ERROR] Failed to save chunks."
+        )
+
+        print(
+            f"Reason: {error}"
+        )
+
+        raise SystemExit(1)
+
+    # ========================================================
+    # FINAL
+    # ========================================================
+
+    print(
+        "\n"
+        + "=" * 70
     )
 
     print(
-        "\n" + "=" * 70
+        "CHUNKING PIPELINE COMPLETED SUCCESSFULLY"
     )
 
-    if has_critical_error:
+    print(
+        "=" * 70
+    )
 
-        print(
-            "CHUNKING COMPLETED WITH ERRORS"
+    print(
+        f"Documents loaded : "
+        f"{len(documents):,}"
+    )
+
+    print(
+        f"Chunks created   : "
+        f"{len(chunks):,}"
+    )
+
+    print(
+        f"Output file      : "
+        f"{CHUNKS_FILE}"
+    )
+
+    print(
+        "=" * 70
+    )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+
+    if str(PROJECT_ROOT) not in sys.path:
+
+        sys.path.insert(
+            0,
+            str(PROJECT_ROOT)
         )
 
-        print(
-            "Fix the validation problems "
-            "before continuing."
-        )
+    try:
+
+        main()
+
+    except KeyboardInterrupt:
 
         print(
-            "=" * 70
+            "\n\n[STOPPED] Pipeline interrupted."
         )
 
         sys.exit(1)
 
-    print(
-        "CHUNKING TEST COMPLETED SUCCESSFULLY"
-    )
+    except SystemExit:
 
-    print("=" * 70)
+        raise
+
+    except Exception as error:
+
+        print(
+            "\n\n[FATAL ERROR]"
+        )
+
+        print(
+            f"{error}"
+        )
+
+        sys.exit(1)
