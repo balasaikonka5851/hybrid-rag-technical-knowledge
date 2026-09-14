@@ -24,3 +24,6 @@ vectorstore/
 # OS
 .DS_Store
 Thumbs.db
+
+# Incomplete groundedness benchmark
+data/evaluation/groundedness_results.json
