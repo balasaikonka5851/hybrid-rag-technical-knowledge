@@ -32,3 +32,6 @@ hybridrag_knowledge_base.zip
 
 # Deployment artifact
 hybridrag_knowledge_base.zip
+
+# Local archives and build artifacts
+*.zip
