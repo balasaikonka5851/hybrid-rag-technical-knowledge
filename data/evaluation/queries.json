@@ -1,0 +1,331 @@
+[
+  {
+    "id": "q01",
+    "query": "How do I create dependencies in FastAPI?",
+    "technology": "fastapi",
+    "relevant_sources": [
+      "tutorial/dependencies/dependencies-in-path-operation-decorators.md",
+      "tutorial/dependencies/sub-dependencies.md",
+      "tutorial/dependencies/classes-as-dependencies.md"
+    ]
+  },
+  {
+    "id": "q02",
+    "query": "How does FastAPI handle RequestValidationError?",
+    "technology": "fastapi",
+    "relevant_sources": [
+      "tutorial/handling-errors.md"
+    ]
+  },
+  {
+    "id": "q03",
+    "query": "How can I validate incoming API data in FastAPI?",
+    "technology": "fastapi",
+    "relevant_sources": [
+      "tutorial/body.md",
+      "tutorial/query-params.md"
+    ]
+  },
+  {
+    "id": "q04",
+    "query": "How do I define a response model in FastAPI?",
+    "technology": "fastapi",
+    "relevant_sources": [
+      "tutorial/response-model.md"
+    ]
+  },
+  {
+    "id": "q05",
+    "query": "How do I raise an HTTPException in FastAPI?",
+    "technology": "fastapi",
+    "relevant_sources": [
+      "tutorial/handling-errors.md",
+      "reference/exceptions.md"
+    ]
+  },
+  {
+    "id": "q06",
+    "query": "How do I create a path operation in FastAPI?",
+    "technology": "fastapi",
+    "relevant_sources": [
+      "tutorial/first-steps.md"
+    ]
+  },
+  {
+    "id": "q07",
+    "query": "How do I use query parameters in FastAPI?",
+    "technology": "fastapi",
+    "relevant_sources": [
+      "tutorial/query-params.md"
+    ]
+  },
+  {
+    "id": "q08",
+    "query": "How do I declare path parameters in FastAPI?",
+    "technology": "fastapi",
+    "relevant_sources": [
+      "tutorial/path-params.md"
+    ]
+  },
+  {
+    "id": "q09",
+    "query": "How do I receive a JSON request body in FastAPI?",
+    "technology": "fastapi",
+    "relevant_sources": [
+      "tutorial/body.md"
+    ]
+  },
+  {
+    "id": "q10",
+    "query": "How can multiple dependencies depend on each other in FastAPI?",
+    "technology": "fastapi",
+    "relevant_sources": [
+      "tutorial/dependencies/sub-dependencies.md"
+    ]
+  },
+  {
+    "id": "q11",
+    "query": "How do I use a class as a dependency in FastAPI?",
+    "technology": "fastapi",
+    "relevant_sources": [
+      "tutorial/dependencies/classes-as-dependencies.md"
+    ]
+  },
+  {
+    "id": "q12",
+    "query": "How do I add global dependencies to a FastAPI application?",
+    "technology": "fastapi",
+    "relevant_sources": [
+      "tutorial/dependencies/global-dependencies.md"
+    ]
+  },
+  {
+    "id": "q13",
+    "query": "How do I set a custom status code for a FastAPI response?",
+    "technology": "fastapi",
+    "relevant_sources": [
+      "tutorial/response-status-code.md"
+    ]
+  },
+  {
+    "id": "q14",
+    "query": "How can I return different response models from a FastAPI endpoint?",
+    "technology": "fastapi",
+    "relevant_sources": [
+      "advanced/additional-responses.md"
+    ]
+  },
+  {
+    "id": "q15",
+    "query": "How do I configure tags for FastAPI path operations?",
+    "technology": "fastapi",
+    "relevant_sources": [
+      "tutorial/path-operation-configuration.md"
+    ]
+  },
+  {
+    "id": "q16",
+    "query": "How do I organize a large FastAPI application into multiple files?",
+    "technology": "fastapi",
+    "relevant_sources": [
+      "tutorial/bigger-applications.md"
+    ]
+  },
+  {
+    "id": "q17",
+    "query": "How do I add middleware to a FastAPI application?",
+    "technology": "fastapi",
+    "relevant_sources": [
+      "tutorial/middleware.md"
+    ]
+  },
+  {
+    "id": "q18",
+    "query": "How do I enable CORS in FastAPI?",
+    "technology": "fastapi",
+    "relevant_sources": [
+      "tutorial/cors.md"
+    ]
+  },
+  {
+    "id": "q19",
+    "query": "How do I create background tasks in FastAPI?",
+    "technology": "fastapi",
+    "relevant_sources": [
+      "tutorial/background-tasks.md"
+    ]
+  },
+  {
+    "id": "q20",
+    "query": "How do I define security dependencies in FastAPI?",
+    "technology": "fastapi",
+    "relevant_sources": [
+      "tutorial/security/index.md"
+    ]
+  },
+  {
+    "id": "q21",
+    "query": "How do I use OAuth2 password authentication in FastAPI?",
+    "technology": "fastapi",
+    "relevant_sources": [
+      "tutorial/security/simple-oauth2.md"
+    ]
+  },
+  {
+    "id": "q22",
+    "query": "How do I upload files with FastAPI?",
+    "technology": "fastapi",
+    "relevant_sources": [
+      "tutorial/request-files.md"
+    ]
+  },
+  {
+    "id": "q23",
+    "query": "How do I handle form data in FastAPI?",
+    "technology": "fastapi",
+    "relevant_sources": [
+      "tutorial/request-forms.md"
+    ]
+  },
+  {
+    "id": "q24",
+    "query": "How do I use cookies and headers in FastAPI requests?",
+    "technology": "fastapi",
+    "relevant_sources": [
+      "tutorial/cookie-params.md",
+      "tutorial/header-params.md"
+    ]
+  },
+  {
+    "id": "q25",
+    "query": "How does Python handle exceptions?",
+    "technology": "python",
+    "relevant_sources": [
+      "tutorial/errors.txt",
+      "library/exceptions.txt"
+    ]
+  },
+  {
+    "id": "q26",
+    "query": "How do I catch exceptions in Python?",
+    "technology": "python",
+    "relevant_sources": [
+      "tutorial/errors.txt"
+    ]
+  },
+  {
+    "id": "q27",
+    "query": "How do I raise an exception in Python?",
+    "technology": "python",
+    "relevant_sources": [
+      "tutorial/errors.txt"
+    ]
+  },
+  {
+    "id": "q28",
+    "query": "What is the purpose of the finally clause in Python exception handling?",
+    "technology": "python",
+    "relevant_sources": [
+      "reference/compound_stmts.txt",
+      "tutorial/errors.txt"
+    ]
+  },
+  {
+    "id": "q29",
+    "query": "How do Python try and except statements work?",
+    "technology": "python",
+    "relevant_sources": [
+      "tutorial/errors.txt",
+      "reference/compound_stmts.txt"
+    ]
+  },
+  {
+    "id": "q30",
+    "query": "What is ValueError in Python?",
+    "technology": "python",
+    "relevant_sources": [
+      "library/exceptions.txt"
+    ]
+  },
+  {
+    "id": "q31",
+    "query": "How do I define a function in Python?",
+    "technology": "python",
+    "relevant_sources": [
+      "tutorial/controlflow.txt"
+    ]
+  },
+  {
+    "id": "q32",
+    "query": "How do default arguments work in Python functions?",
+    "technology": "python",
+    "relevant_sources": [
+      "tutorial/controlflow.txt"
+    ]
+  },
+  {
+    "id": "q33",
+    "query": "How do Python classes work?",
+    "technology": "python",
+    "relevant_sources": [
+      "tutorial/classes.txt"
+    ]
+  },
+  {
+    "id": "q34",
+    "query": "How does inheritance work in Python classes?",
+    "technology": "python",
+    "relevant_sources": [
+      "tutorial/classes.txt"
+    ]
+  },
+  {
+    "id": "q35",
+    "query": "How do I import a module in Python?",
+    "technology": "python",
+    "relevant_sources": [
+      "tutorial/modules.txt"
+    ]
+  },
+  {
+    "id": "q36",
+    "query": "What is a Python package and how is it imported?",
+    "technology": "python",
+    "relevant_sources": [
+      "tutorial/modules.txt"
+    ]
+  },
+  {
+    "id": "q37",
+    "query": "How do async and await work in Python?",
+    "technology": "python",
+    "relevant_sources": [
+      "library/asyncio.txt",
+      "reference/compound_stmts.txt"
+    ]
+  },
+  {
+    "id": "q38",
+    "query": "How do generators work in Python?",
+    "technology": "python",
+    "relevant_sources": [
+      "tutorial/classes.txt"
+    ]
+  },
+  {
+    "id": "q39",
+    "query": "How do context managers work with the with statement in Python?",
+    "technology": "python",
+    "relevant_sources": [
+      "reference/compound_stmts.txt"
+    ]
+  },
+  {
+    "id": "q40",
+    "query": "How do list comprehensions work in Python?",
+    "technology": "python",
+    "relevant_sources": [
+      "tutorial/datastructures.txt"
+    ]
+  }
+]

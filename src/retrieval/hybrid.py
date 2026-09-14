@@ -1,141 +1,111 @@
 """
-HybridRAG - Hybrid Retrieval
+Hybrid Retrieval using Weighted Reciprocal Rank Fusion (RRF).
 
 Combines:
+1. BM25 keyword retrieval
+2. Semantic FAISS retrieval
 
-    1. Semantic retrieval using FAISS
-    2. Keyword retrieval using BM25
-
-using Reciprocal Rank Fusion (RRF).
-
-Pipeline:
-
-    Query
-      |
-      +----> FAISS semantic search
-      |
-      +----> BM25 keyword search
-      |
-      v
-    RRF fusion
-      |
-      v
-    Hybrid ranked results
+The implementation supports configurable weights so we can
+experimentally determine the best BM25/Semantic balance.
 """
 
 from __future__ import annotations
 
-import sys
 from typing import Any
 
-from bm25 import BM25Retriever, load_chunks
-from semantic import SemanticRetriever
 
+DEFAULT_RRF_K = 60
+DEFAULT_SEMANTIC_TOP_K = 20
+DEFAULT_BM25_TOP_K = 20
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+try:
+    from src.retrieval.bm25 import BM25Retriever, load_chunks
+    from src.retrieval.semantic import SemanticRetriever
+except ModuleNotFoundError:
+    from .bm25 import BM25Retriever, load_chunks
+    from .semantic import SemanticRetriever
 
-DEFAULT_TOP_K = 5
-
-# RRF constant.
-#
-# Standard choice:
-#
-#       k = 60
-#
-# Larger k reduces the influence of very high rankings.
-RRF_K = 60
-
-
-# ============================================================
-# HYBRID RETRIEVER
-# ============================================================
 
 class HybridRetriever:
     """
-    Hybrid retrieval using FAISS + BM25 + RRF.
+    Hybrid BM25 + semantic retriever using weighted RRF.
     """
 
     def __init__(
         self,
-        semantic_top_k: int = 20,
-        bm25_top_k: int = 20,
+        semantic_top_k: int = DEFAULT_SEMANTIC_TOP_K,
+        bm25_top_k: int = DEFAULT_BM25_TOP_K,
+        semantic_weight: float = 0.5,
+        bm25_weight: float = 0.5,
+        rrf_k: int = DEFAULT_RRF_K,
     ) -> None:
 
         if semantic_top_k <= 0:
-            raise ValueError(
-                "semantic_top_k must be greater than zero."
-            )
+            raise ValueError("semantic_top_k must be > 0")
 
         if bm25_top_k <= 0:
+            raise ValueError("bm25_top_k must be > 0")
+
+        if rrf_k <= 0:
+            raise ValueError("rrf_k must be > 0")
+
+        if semantic_weight < 0:
+            raise ValueError("semantic_weight must be >= 0")
+
+        if bm25_weight < 0:
+            raise ValueError("bm25_weight must be >= 0")
+
+        if semantic_weight == 0 and bm25_weight == 0:
             raise ValueError(
-                "bm25_top_k must be greater than zero."
+                "At least one retrieval weight must be greater than 0"
             )
+
+        self.semantic_top_k = semantic_top_k
+        self.bm25_top_k = bm25_top_k
+        self.semantic_weight = semantic_weight
+        self.bm25_weight = bm25_weight
+        self.rrf_k = rrf_k
 
         print()
         print("=" * 80)
         print("INITIALIZING HYBRID RETRIEVER")
         print("=" * 80)
 
-        # ----------------------------------------------------
-        # Semantic retriever
-        # ----------------------------------------------------
+        print()
+        print("[1/2] Initializing semantic retriever...")
+
+        self.semantic = SemanticRetriever()
 
         print()
-        print("[1/3] Initializing semantic retriever...")
-
-        self.semantic_retriever = (
-            SemanticRetriever()
-        )
-
-        # ----------------------------------------------------
-        # BM25 retriever
-        # ----------------------------------------------------
-
-        print()
-        print("[2/3] Initializing BM25 retriever...")
+        print("[2/2] Initializing BM25 retriever...")
 
         chunks = load_chunks()
-
-        self.bm25_retriever = BM25Retriever(
-            chunks
-        )
-
-        # ----------------------------------------------------
-        # Configuration
-        # ----------------------------------------------------
+        self.bm25 = BM25Retriever(chunks)
 
         print()
-        print("[3/3] Configuring RRF...")
+        print("[OK] Hybrid retriever ready.")
+        print(f"  Semantic candidates : {self.semantic_top_k}")
+        print(f"  BM25 candidates     : {self.bm25_top_k}")
+        print(f"  Semantic weight     : {self.semantic_weight:.2f}")
+        print(f"  BM25 weight         : {self.bm25_weight:.2f}")
+        print(f"  RRF k               : {self.rrf_k}")
 
-        self.semantic_top_k = semantic_top_k
-        self.bm25_top_k = bm25_top_k
-        self.rrf_k = RRF_K
+    @staticmethod
+    def _validate_results(
+        results: list[dict[str, Any]],
+        method_name: str,
+    ) -> None:
+        """
+        Validate that every retrieval result contains a chunk ID.
+        """
 
-        print(
-            f"[OK] Semantic candidates: "
-            f"{semantic_top_k}"
-        )
+        for result in results:
+            chunk_id = result.get("chunk_id")
 
-        print(
-            f"[OK] BM25 candidates: "
-            f"{bm25_top_k}"
-        )
-
-        print(
-            f"[OK] RRF k: "
-            f"{self.rrf_k}"
-        )
-
-        print()
-        print(
-            "[OK] Hybrid retriever ready."
-        )
-
-    # ========================================================
-    # RRF
-    # ========================================================
+            if not chunk_id:
+                raise ValueError(
+                    f"{method_name} result is missing chunk_id."
+                )
 
     def reciprocal_rank_fusion(
         self,
@@ -143,102 +113,80 @@ class HybridRetriever:
         bm25_results: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         """
-        Combine semantic and BM25 rankings using RRF.
+        Weighted Reciprocal Rank Fusion.
 
-        Formula:
+        Score:
 
-            RRF(d) =
-                1 / (k + rank_semantic)
-                +
-                1 / (k + rank_bm25)
+            semantic_weight / (rrf_k + semantic_rank)
+          + bm25_weight / (rrf_k + bm25_rank)
 
-        A document appearing in both rankings receives
-        contributions from both systems.
+        Results are merged by chunk_id.
         """
 
-        # ----------------------------------------------------
-        # Store fused information by chunk ID.
-        # ----------------------------------------------------
+        self._validate_results(semantic_results, "Semantic")
+        self._validate_results(bm25_results, "BM25")
 
         fused: dict[str, dict[str, Any]] = {}
 
-        # ----------------------------------------------------
-        # Semantic contribution
-        # ----------------------------------------------------
+        # ---------------------------------------------------------
+        # Semantic results
+        # ---------------------------------------------------------
 
-        for result in semantic_results:
-
-            chunk_id = result["chunk_id"]
-
-            if chunk_id not in fused:
-
-                fused[chunk_id] = {
-                    "chunk_id": chunk_id,
-                    "text": result["text"],
-                    "metadata": result["metadata"],
-                    "semantic_rank": None,
-                    "semantic_score": None,
-                    "bm25_rank": None,
-                    "bm25_score": None,
-                    "rrf_score": 0.0,
-                }
-
-            rank = result["rank"]
-
-            fused[chunk_id][
-                "semantic_rank"
-            ] = rank
-
-            fused[chunk_id][
-                "semantic_score"
-            ] = result["score"]
-
-            fused[chunk_id][
-                "rrf_score"
-            ] += 1.0 / (
-                self.rrf_k + rank
-            )
-
-        # ----------------------------------------------------
-        # BM25 contribution
-        # ----------------------------------------------------
-
-        for result in bm25_results:
+        for rank, result in enumerate(semantic_results, start=1):
 
             chunk_id = result["chunk_id"]
 
             if chunk_id not in fused:
-
                 fused[chunk_id] = {
                     "chunk_id": chunk_id,
-                    "text": result["text"],
-                    "metadata": result["metadata"],
+                    "text": result.get("text", ""),
+                    "metadata": result.get("metadata", {}),
+                    "rrf_score": 0.0,
                     "semantic_rank": None,
                     "semantic_score": None,
                     "bm25_rank": None,
                     "bm25_score": None,
-                    "rrf_score": 0.0,
                 }
 
-            rank = result["rank"]
+            fused[chunk_id]["semantic_rank"] = rank
+            fused[chunk_id]["semantic_score"] = result.get("score")
 
-            fused[chunk_id][
-                "bm25_rank"
-            ] = rank
-
-            fused[chunk_id][
-                "bm25_score"
-            ] = result["score"]
-
-            fused[chunk_id][
-                "rrf_score"
-            ] += 1.0 / (
-                self.rrf_k + rank
+            fused[chunk_id]["rrf_score"] += (
+                self.semantic_weight
+                / (self.rrf_k + rank)
             )
 
-        # ----------------------------------------------------
-        # Sort by RRF score
-        # ----------------------------------------------------
+        # ---------------------------------------------------------
+        # BM25 results
+        # ---------------------------------------------------------
+
+        for rank, result in enumerate(bm25_results, start=1):
+
+            chunk_id = result["chunk_id"]
+
+            if chunk_id not in fused:
+                fused[chunk_id] = {
+                    "chunk_id": chunk_id,
+                    "text": result.get("text", ""),
+                    "metadata": result.get("metadata", {}),
+                    "rrf_score": 0.0,
+                    "semantic_rank": None,
+                    "semantic_score": None,
+                    "bm25_rank": None,
+                    "bm25_score": None,
+                }
+
+            fused[chunk_id]["bm25_rank"] = rank
+            fused[chunk_id]["bm25_score"] = result.get("score")
+
+            fused[chunk_id]["rrf_score"] += (
+                self.bm25_weight
+                / (self.rrf_k + rank)
+            )
+
+        # ---------------------------------------------------------
+        # Sort
+        # ---------------------------------------------------------
 
         ranked = sorted(
             fused.values(),
@@ -246,93 +194,42 @@ class HybridRetriever:
             reverse=True,
         )
 
-        # ----------------------------------------------------
         # Add final rank
-        # ----------------------------------------------------
-
-        for rank, result in enumerate(
-            ranked,
-            start=1,
-        ):
-
+        for rank, result in enumerate(ranked, start=1):
             result["rank"] = rank
 
         return ranked
 
-    # ========================================================
-    # SEARCH
-    # ========================================================
-
     def search(
         self,
         query: str,
-        top_k: int = DEFAULT_TOP_K,
     ) -> dict[str, Any]:
         """
-        Run semantic retrieval, BM25 retrieval,
-        and RRF fusion.
+        Search using semantic retrieval, BM25, and weighted RRF.
         """
 
         if not isinstance(query, str):
-            raise TypeError(
-                "Query must be a string."
-            )
+            raise TypeError("query must be a string")
 
         query = query.strip()
 
         if not query:
-            raise ValueError(
-                "Query cannot be empty."
-            )
+            raise ValueError("query cannot be empty")
 
-        if top_k <= 0:
-            raise ValueError(
-                "top_k must be greater than zero."
-            )
-
-        # ----------------------------------------------------
-        # Semantic search
-        # ----------------------------------------------------
-
-        semantic_results = (
-            self.semantic_retriever.search(
-                query=query,
-                top_k=self.semantic_top_k,
-            )
+        semantic_results = self.semantic.search(
+            query,
+            top_k=self.semantic_top_k,
         )
 
-        # ----------------------------------------------------
-        # BM25 search
-        # ----------------------------------------------------
-
-        bm25_results = (
-            self.bm25_retriever.search(
-                query=query,
-                top_k=self.bm25_top_k,
-            )
+        bm25_results = self.bm25.search(
+            query,
+            top_k=self.bm25_top_k,
         )
 
-        # ----------------------------------------------------
-        # RRF
-        # ----------------------------------------------------
-
-        hybrid_results = (
-            self.reciprocal_rank_fusion(
-                semantic_results=semantic_results,
-                bm25_results=bm25_results,
-            )
+        hybrid_results = self.reciprocal_rank_fusion(
+            semantic_results=semantic_results,
+            bm25_results=bm25_results,
         )
-
-        # ----------------------------------------------------
-        # Final top-k
-        # ----------------------------------------------------
-
-        hybrid_results = hybrid_results[
-            : min(
-                top_k,
-                len(hybrid_results),
-            )
-        ]
 
         return {
             "query": query,
@@ -342,264 +239,105 @@ class HybridRetriever:
         }
 
 
-# ============================================================
-# DISPLAY
-# ============================================================
-
-def display_hybrid_results(
-    output: dict[str, Any],
+def print_results(
+    title: str,
+    results: list[dict[str, Any]],
+    top_k: int = 10,
 ) -> None:
-
-    query = output["query"]
-
-    semantic_results = output[
-        "semantic_results"
-    ]
-
-    bm25_results = output[
-        "bm25_results"
-    ]
-
-    hybrid_results = output[
-        "hybrid_results"
-    ]
-
-    # --------------------------------------------------------
-    # Semantic ranking
-    # --------------------------------------------------------
+    """
+    Pretty-print retrieval results.
+    """
 
     print()
-    print("=" * 90)
-    print("SEMANTIC TOP RESULTS")
-    print("=" * 90)
+    print("=" * 100)
+    print(title)
+    print("=" * 100)
 
-    for result in semantic_results[:5]:
+    for result in results[:top_k]:
 
-        metadata = result["metadata"]
+        metadata = result.get("metadata", {})
 
-        print(
-            f"{result['rank']:>2}. "
-            f"score={result['score']:.4f} | "
-            f"{metadata['technology']:<7} | "
-            f"{metadata['source']}"
-        )
-
-    # --------------------------------------------------------
-    # BM25 ranking
-    # --------------------------------------------------------
-
-    print()
-    print("=" * 90)
-    print("BM25 TOP RESULTS")
-    print("=" * 90)
-
-    for result in bm25_results[:5]:
-
-        metadata = result["metadata"]
-
-        print(
-            f"{result['rank']:>2}. "
-            f"score={result['score']:.4f} | "
-            f"{metadata['technology']:<7} | "
-            f"{metadata['source']}"
-        )
-
-    # --------------------------------------------------------
-    # Hybrid ranking
-    # --------------------------------------------------------
-
-    print()
-    print("=" * 90)
-    print("HYBRID RRF TOP RESULTS")
-    print("=" * 90)
-
-    for result in hybrid_results:
-
-        metadata = result["metadata"]
-
-        semantic_rank = (
-            result["semantic_rank"]
-            if result["semantic_rank"] is not None
-            else "-"
-        )
-
-        bm25_rank = (
-            result["bm25_rank"]
-            if result["bm25_rank"] is not None
-            else "-"
-        )
+        technology = metadata.get("technology", "unknown")
+        source = metadata.get("source", "unknown")
+        section = metadata.get("section", "")
 
         print()
         print(
-            f"Rank {result['rank']}"
+            f"Rank {result.get('rank', '-')}"
+            f" | chunk={result.get('chunk_id', '-')}"
         )
 
         print(
-            f"RRF score      : "
-            f"{result['rrf_score']:.6f}"
+            f"Score={result.get('score', result.get('rrf_score', 0)):.4f}"
         )
 
-        print(
-            f"Semantic rank  : "
-            f"{semantic_rank}"
-        )
+        print(f"Technology={technology}")
+        print(f"Source={source}")
 
-        print(
-            f"BM25 rank      : "
-            f"{bm25_rank}"
-        )
+        if section:
+            print(f"Section={section}")
 
-        print(
-            f"Semantic score : "
-            f"{result['semantic_score']}"
-        )
+        print(f"Text={result.get('text', '')[:400]}...")
 
-        print(
-            f"BM25 score     : "
-            f"{result['bm25_score']}"
-        )
-
-        print(
-            f"Technology     : "
-            f"{metadata['technology']}"
-        )
-
-        print(
-            f"Source         : "
-            f"{metadata['source']}"
-        )
-
-        print(
-            f"Section        : "
-            f"{metadata['section']}"
-        )
-
-        print(
-            f"Chunk ID       : "
-            f"{result['chunk_id']}"
-        )
-
-        print()
-
-        text = result["text"]
-
-        if len(text) > 600:
-            text = text[:600] + "..."
-
-        print(text)
-
-    print()
-    print("=" * 90)
-
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main() -> None:
 
-    print("=" * 90)
-    print("HYBRID RAG - HYBRID RETRIEVAL")
-    print("=" * 90)
+    print("=" * 80)
+    print("HYBRID RAG - WEIGHTED RRF RETRIEVAL")
+    print("=" * 80)
 
-    try:
+    retriever = HybridRetriever(
+        semantic_top_k=20,
+        bm25_top_k=20,
+        semantic_weight=0.75,
+        bm25_weight=0.25,
+        rrf_k=60,
+    )
 
-        retriever = HybridRetriever(
-            semantic_top_k=20,
-            bm25_top_k=20,
-        )
+    while True:
 
-        print()
-        print("Hybrid retriever ready.")
+        try:
+            query = input(
+                "\nEnter query "
+                "(or type 'exit' to quit): "
+            ).strip()
 
-        print()
-        print(
-            "Test queries:"
-        )
+        except (KeyboardInterrupt, EOFError):
+            print("\nExiting.")
+            break
 
-        print(
-            "  1. How do I create dependencies in FastAPI?"
-        )
+        if query.lower() == "exit":
+            print("Exiting.")
+            break
 
-        print(
-            "  2. RequestValidationError"
-        )
+        if not query:
+            print("Please enter a non-empty query.")
+            continue
 
-        print(
-            "  3. How can I validate incoming API data?"
-        )
+        try:
+            result = retriever.search(query)
 
-        print(
-            "  4. Python exception handling"
-        )
+            print_results(
+                "SEMANTIC RESULTS",
+                result["semantic_results"],
+                top_k=5,
+            )
 
-        print()
-        print("Type 'exit' to stop.")
+            print_results(
+                "BM25 RESULTS",
+                result["bm25_results"],
+                top_k=5,
+            )
 
-        while True:
+            print_results(
+                "WEIGHTED HYBRID RESULTS",
+                result["hybrid_results"],
+                top_k=10,
+            )
 
-            try:
-
-                query = input(
-                    "\nQuery: "
-                ).strip()
-
-            except (
-                KeyboardInterrupt,
-                EOFError,
-            ):
-
-                print()
-                print("Exiting.")
-
-                break
-
-            if query.lower() in {
-                "exit",
-                "quit",
-            }:
-
-                print("Exiting.")
-                break
-
-            if not query:
-
-                print(
-                    "[WARNING] "
-                    "Please enter a question."
-                )
-
-                continue
-
-            try:
-
-                output = retriever.search(
-                    query=query,
-                    top_k=5,
-                )
-
-                display_hybrid_results(
-                    output
-                )
-
-            except Exception as exc:
-
-                print()
-                print(
-                    f"[ERROR] Search failed: {exc}"
-                )
-
-    except Exception as exc:
-
-        print()
-        print("=" * 90)
-        print("HYBRID RETRIEVER FAILED")
-        print("=" * 90)
-
-        print()
-        print(f"[ERROR] {exc}")
-
-        sys.exit(1)
+        except Exception as exc:
+            print()
+            print(f"[ERROR] Retrieval failed: {exc}")
 
 
 if __name__ == "__main__":

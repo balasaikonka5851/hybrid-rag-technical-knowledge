@@ -1,0 +1,16 @@
+pymupdf
+sentence-transformers
+faiss-cpu
+rank-bm25
+numpy
+pandas
+scikit-learn
+torch
+transformers
+google-genai
+python-dotenv
+streamlit
+python-docx
+beautifulsoup4
+openpyxl
+python-pptx

@@ -677,18 +677,37 @@ def merge_tiny_chunks(
 # CHUNK ONE DOCUMENT
 # ============================================================
 
+# ============================================================
+# CHUNK ONE DOCUMENT
+# ============================================================
+
 def chunk_document(
     document: Dict[str, Any]
 ) -> List[Dict[str, Any]]:
     """
-    Convert one normalized document into chunks.
+    Convert one normalized document into retrieval chunks.
+
+    The ingestion layer is responsible for parsing the original
+    file format. By this stage, every document is normalized into
+    plain text plus metadata.
+
+    Therefore this function is intentionally format-agnostic.
+
+    Structure-aware behavior:
+        - Markdown: preserves extracted section information
+          when supplied by the ingestion layer.
+        - Other formats: use existing section metadata when
+          available, otherwise "General".
+
+    Supported source formats include:
+        PDF, DOCX, XLSX, PPTX, HTML, Markdown, TXT,
+        SQL, JSON, CSV, XML, source code, YAML, etc.
     """
 
     if not isinstance(
         document,
         dict
     ):
-
         raise TypeError(
             "document must be a dictionary."
         )
@@ -707,7 +726,6 @@ def chunk_document(
         text,
         str
     ):
-
         raise ValueError(
             "document.text must be a string."
         )
@@ -716,7 +734,6 @@ def chunk_document(
         metadata,
         dict
     ):
-
         raise ValueError(
             "document.metadata must be a dictionary."
         )
@@ -726,7 +743,6 @@ def chunk_document(
     )
 
     if not text:
-
         return []
 
     document_id = str(
@@ -765,12 +781,44 @@ def chunk_document(
         or "unknown"
     )
 
-    raw_chunks: List[
-        Dict[str, Any]
-    ] = []
+    # --------------------------------------------------------
+    # Preserve ingestion metadata
+    # --------------------------------------------------------
+
+    source_section = str(
+        metadata.get(
+            "section",
+            ""
+        )
+        or ""
+    ).strip()
+
+    source_title = str(
+        metadata.get(
+            "title",
+            ""
+        )
+        or ""
+    ).strip()
+
+    source_page = metadata.get(
+        "page"
+    )
+
+    source_sheet = str(
+        metadata.get(
+            "sheet",
+            ""
+        )
+        or ""
+    ).strip()
+
+    source_slide = metadata.get(
+        "slide"
+    )
 
     # ========================================================
-    # MARKDOWN
+    # SECTION-AWARE MARKDOWN
     # ========================================================
 
     if file_type == ".md":
@@ -779,104 +827,161 @@ def chunk_document(
             text
         )
 
-        for section_index, section in enumerate(
-            sections
-        ):
+    # ========================================================
+    # ALL OTHER NORMALIZED FORMATS
+    # ========================================================
 
-            section_name = str(
-                section["section"]
+    else:
+
+        section_name = (
+            source_section
+            or source_title
+            or source_sheet
+            or "General"
+        )
+
+        sections = [
+            {
+                "section": section_name,
+                "level": 0,
+                "text": text
+            }
+        ]
+
+    raw_chunks: List[
+        Dict[str, Any]
+    ] = []
+
+    # ========================================================
+    # CREATE CHUNKS FROM SECTIONS
+    # ========================================================
+
+    for section_index, section in enumerate(
+        sections
+    ):
+
+        section_name = str(
+            section.get(
+                "section",
+                "General"
             )
+        ).strip()
 
-            section_level = int(
-                section["level"]
+        if not section_name:
+            section_name = "General"
+
+        section_level = int(
+            section.get(
+                "level",
+                0
             )
+            or 0
+        )
 
-            section_text = str(
-                section["text"]
+        section_text = str(
+            section.get(
+                "text",
+                ""
             )
+            or ""
+        ).strip()
 
-            # Add section context.
-            if section_name not in {
+        if not section_text:
+            continue
+
+        # ----------------------------------------------------
+        # Add useful section context
+        # ----------------------------------------------------
+
+        if (
+            file_type == ".md"
+            and section_name not in {
                 "General",
                 "Preamble"
-            }:
-
-                contextual_text = (
-                    f"Section: "
-                    f"{section_name}\n\n"
-                    f"{section_text}"
-                )
-
-            else:
-
-                contextual_text = section_text
-
-            pieces = split_large_text(
-                contextual_text
+            }
+        ):
+            contextual_text = (
+                f"Section: "
+                f"{section_name}\n\n"
+                f"{section_text}"
             )
 
-            for piece_index, piece in enumerate(
-                pieces
-            ):
-
-                chunk_id = (
-                    f"{document_id}_"
-                    f"{section_index}_"
-                    f"{piece_index}"
-                )
-
-                raw_chunks.append(
-                    create_chunk(
-                        chunk_id=chunk_id,
-                        text=piece,
-                        document_id=document_id,
-                        technology=technology,
-                        source=source,
-                        file_name=file_name,
-                        file_type=file_type,
-                        section=section_name,
-                        section_level=section_level,
-                        chunk_index=piece_index
-                    )
-                )
-
-    # ========================================================
-    # PLAIN TEXT
-    # ========================================================
-
-    elif file_type == ".txt":
+        else:
+            contextual_text = section_text
 
         pieces = split_large_text(
-            text
+            contextual_text
         )
+
+        # ----------------------------------------------------
+        # Create chunk records
+        # ----------------------------------------------------
 
         for piece_index, piece in enumerate(
             pieces
         ):
 
+            # Keep the ID deterministic and unique.
             chunk_id = (
                 f"{document_id}_"
+                f"{section_index}_"
                 f"{piece_index}"
             )
 
-            raw_chunks.append(
-                create_chunk(
-                    chunk_id=chunk_id,
-                    text=piece,
-                    document_id=document_id,
-                    technology=technology,
-                    source=source,
-                    file_name=file_name,
-                    file_type=file_type,
-                    section="General",
-                    section_level=0,
-                    chunk_index=piece_index
-                )
+            chunk = create_chunk(
+                chunk_id=chunk_id,
+                text=piece,
+                document_id=document_id,
+                technology=technology,
+                source=source,
+                file_name=file_name,
+                file_type=file_type,
+                section=section_name,
+                section_level=section_level,
+                chunk_index=piece_index
             )
 
-    else:
+            # ------------------------------------------------
+            # Preserve rich ingestion metadata
+            # ------------------------------------------------
 
-        return []
+            chunk_metadata = chunk[
+                "metadata"
+            ]
+
+            if source_page is not None:
+                chunk_metadata["page"] = (
+                    source_page
+                )
+
+            if source_title:
+                chunk_metadata["title"] = (
+                    source_title
+                )
+
+            if source_sheet:
+                chunk_metadata["sheet"] = (
+                    source_sheet
+                )
+
+            if source_slide is not None:
+                chunk_metadata["slide"] = (
+                    source_slide
+                )
+
+            # Preserve content type if provided.
+            if metadata.get(
+                "content_type"
+            ):
+                chunk_metadata[
+                    "content_type"
+                ] = metadata[
+                    "content_type"
+                ]
+
+            raw_chunks.append(
+                chunk
+            )
 
     # --------------------------------------------------------
     # Robust tiny-chunk cleanup
