@@ -29,3 +29,6 @@ Thumbs.db
 data/evaluation/groundedness_results.json
 # Deployment artifact
 hybridrag_knowledge_base.zip
+
+# Deployment artifact
+hybridrag_knowledge_base.zip
