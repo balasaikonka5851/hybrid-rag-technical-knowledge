@@ -1,54 +1,60 @@
 """
-HybridRAG - Technical Knowledge Retrieval & Question Answering System
+HybridRAG — Strong Final Streamlit UI
+======================================
 
-Streamlit demonstration interface for:
-    - Hybrid retrieval
-    - BM25 keyword search
-    - Semantic vector search
-    - Reciprocal Rank Fusion
-    - Grounded generation
-    - Citation validation
-    - Source inspection
-    - Retrieval diagnostics
+Production-style presentation layer for the existing HybridRAG backend.
+
+Highlights
+----------
+- Responsive desktop/mobile layout using native Streamlit components.
+- Project-relative architecture image.
+- Evidence-first answer presentation.
+- Citation validation.
+- Explicit Gemini quota/rate-limit handling.
+- No automatic retry storms that can consume more quota.
+- Session-level successful-answer cache to avoid duplicate generation calls.
+- Safe "Retry last query" control after transient/provider failures.
+- Clear provider/backend status.
+- Retrieval diagnostics only use fields actually returned by RAGPipeline.
+- No secrets, API keys, stack traces, or raw provider responses are displayed.
+
+Run from the project root:
+    streamlit run app/streamlit_app.py
 """
 
 from __future__ import annotations
 
-import json
+import hashlib
 import sys
-import time
 from pathlib import Path
-from datetime import datetime
+from typing import Any
 
 import streamlit as st
 
 
-# ============================================================
+# ============================================================================
 # PROJECT PATH
-# ============================================================
+# ============================================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ASSETS_DIR = PROJECT_ROOT / "app" / "assets"
+ARCHITECTURE_IMAGE = ASSETS_DIR / "hybridrag_architecture.png"
 
 if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(
-        0,
-        str(PROJECT_ROOT)
-    )
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 
-# ============================================================
-# IMPORTS
-# ============================================================
+# ============================================================================
+# BACKEND IMPORTS
+# ============================================================================
 
 from src.pipeline.rag_pipeline import RAGPipeline
-from src.evaluation.citation_validator import (
-    validate_citations,
-)
+from src.evaluation.citation_validator import validate_citations
 
 
-# ============================================================
-# PAGE CONFIGURATION
-# ============================================================
+# ============================================================================
+# PAGE CONFIG
+# ============================================================================
 
 st.set_page_config(
     page_title="HybridRAG",
@@ -58,109 +64,216 @@ st.set_page_config(
 )
 
 
-# ============================================================
-# CUSTOM CSS
-# ============================================================
+# ============================================================================
+# CONSTANTS
+# ============================================================================
+
+APP_VERSION = "2.0"
+MAX_QUERY_LENGTH = 2000
+CACHE_LIMIT = 20
+
+EXAMPLES = [
+    "How do I create dependencies in FastAPI?",
+    "How does Python handle exceptions?",
+    "How can I validate data received by an API?",
+    "What is RequestValidationError in FastAPI?",
+    "How does Python's yield keyword work?",
+]
+
+
+# ============================================================================
+# SESSION STATE
+# ============================================================================
+
+DEFAULT_STATE = {
+    "last_result": None,
+    "last_query": "",
+    "last_status": "idle",
+    "answer_cache": {},
+}
+
+for key, value in DEFAULT_STATE.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
+# ============================================================================
+# SAFE HELPERS
+# ============================================================================
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def ms(value: Any) -> str:
+    return f"{safe_float(value):,.0f} ms"
+
+
+def seconds(value: Any) -> str:
+    return f"{safe_float(value) / 1000:.1f} s"
+
+
+def normalize_query(query: str) -> str:
+    return " ".join(query.strip().split())
+
+
+def query_key(query: str) -> str:
+    normalized = normalize_query(query).lower()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def source_location(source: dict[str, Any]) -> str:
+    parts: list[str] = []
+
+    if source.get("page") is not None:
+        parts.append(f"Page {source['page']}")
+
+    if source.get("sheet"):
+        parts.append(f"Sheet: {source['sheet']}")
+
+    if source.get("slide") is not None:
+        parts.append(f"Slide {source['slide']}")
+
+    return " · ".join(parts)
+
+
+def is_quota_error(result: dict[str, Any]) -> bool:
+    error_type = str(result.get("error_type") or "").lower()
+    error_message = str(result.get("error_message") or "").lower()
+
+    indicators = (
+        "429",
+        "quota",
+        "resource_exhausted",
+        "too_many_requests",
+        "rate limit",
+        "rate_limit",
+        "generate_content_free_tier_requests",
+    )
+
+    return any(item in error_type or item in error_message for item in indicators)
+
+
+def is_retrieval_error(result: dict[str, Any]) -> bool:
+    error_type = str(result.get("error_type") or "").lower()
+    return "retrieval" in error_type
+
+
+def is_generation_error(result: dict[str, Any]) -> bool:
+    error_type = str(result.get("error_type") or "").lower()
+    return "generation" in error_type or "api" in error_type
+
+
+def render_metrics(items: list[tuple[str, str, str]]) -> None:
+    columns = st.columns(len(items), gap="small")
+
+    for column, (label, value, help_text) in zip(columns, items):
+        with column:
+            st.metric(label, value, help=help_text)
+
+
+def cache_successful_result(query: str, result: dict[str, Any]) -> None:
+    if not isinstance(result, dict):
+        return
+
+    if not result.get("success", False):
+        return
+
+    cache = st.session_state.answer_cache
+    cache[query_key(query)] = {
+        "query": normalize_query(query),
+        "result": result,
+    }
+
+    # Keep only the newest CACHE_LIMIT entries.
+    while len(cache) > CACHE_LIMIT:
+        oldest_key = next(iter(cache))
+        del cache[oldest_key]
+
+
+def get_cached_result(query: str) -> dict[str, Any] | None:
+    item = st.session_state.answer_cache.get(query_key(query))
+    if not isinstance(item, dict):
+        return None
+
+    result = item.get("result")
+    return result if isinstance(result, dict) else None
+
+
+def clear_current_result() -> None:
+    st.session_state.last_result = None
+    st.session_state.last_query = ""
+    st.session_state.last_status = "idle"
+
+
+# ============================================================================
+# LIGHTWEIGHT RESPONSIVE CSS
+# ============================================================================
 
 st.markdown(
     """
     <style>
     .block-container {
-        padding-top: 1.8rem;
-        padding-bottom: 2rem;
         max-width: 1500px;
+        padding-top: 1.15rem;
+        padding-bottom: 2.5rem;
+        padding-left: clamp(0.75rem, 3vw, 3rem);
+        padding-right: clamp(0.75rem, 3vw, 3rem);
     }
 
-    .hero {
-        padding: 1.8rem 2rem;
-        border-radius: 22px;
-        border: 1px solid rgba(128,128,128,.22);
-        background: linear-gradient(135deg, rgba(127,127,127,.12), rgba(127,127,127,.04));
-        margin-bottom: 1.2rem;
-    }
-    .hero-title {
-        font-size: clamp(2.2rem, 5vw, 3.8rem);
-        line-height: 1;
-        font-weight: 850;
-        letter-spacing: -0.04em;
-        margin: 0;
-    }
-    .hero-subtitle {
-        margin-top: .7rem;
-        font-size: 1.05rem;
-        opacity: .78;
-        max-width: 850px;
+    .app-subtitle {
+        font-size: 1rem;
+        line-height: 1.55;
+        opacity: 0.72;
+        max-width: 920px;
+        margin-top: -0.35rem;
+        margin-bottom: 0.7rem;
     }
 
-    .badge {
-        display: inline-block;
-        padding: .28rem .65rem;
-        border-radius: 999px;
-        border: 1px solid rgba(128,128,128,.28);
-        font-size: .78rem;
-        margin: .25rem .3rem .1rem 0;
+    .trust-line {
+        font-size: 0.82rem;
+        line-height: 1.8;
+        opacity: 0.70;
+        margin-bottom: 1.1rem;
     }
 
-    .answer-card {
-        padding: 1.4rem 1.5rem;
-        border-radius: 18px;
-        border: 1px solid rgba(128,128,128,.24);
-        background: rgba(127,127,127,.045);
-        margin: .5rem 0 1rem 0;
-    }
-
-    .source-card {
-        padding: 1rem;
-        border-radius: 14px;
-        border: 1px solid rgba(128,128,128,.20);
-        background: rgba(127,127,127,.035);
-        margin-bottom: .7rem;
-    }
-
-    .small-muted {
-        font-size: .82rem;
-        opacity: .68;
-    }
-
-    .trust-row {
-        display: flex;
-        gap: .6rem;
-        flex-wrap: wrap;
-        margin: .7rem 0;
-    }
-
-    .trust-pill {
-        border: 1px solid rgba(128,128,128,.22);
-        border-radius: 999px;
-        padding: .35rem .7rem;
-        font-size: .82rem;
+    .small-note {
+        font-size: 0.78rem;
+        opacity: 0.65;
     }
 
     div[data-testid="stMetric"] {
-        border: 1px solid rgba(128,128,128,.18);
-        padding: .8rem;
-        border-radius: 14px;
+        min-height: 86px;
     }
 
-    textarea {
-        border-radius: 14px !important;
-    }
+    @media (max-width: 600px) {
+        .block-container {
+            padding-top: 0.65rem;
+            padding-left: 0.65rem;
+            padding-right: 0.65rem;
+        }
 
-    .architecture {
-        font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-        font-size: .88rem;
-        line-height: 1.65;
-        padding: 1.15rem;
-        border-radius: 15px;
-        border: 1px solid rgba(128,128,128,.22);
-        overflow-x: auto;
-    }
+        .app-subtitle {
+            font-size: 0.9rem;
+        }
 
-    .footer {
-        text-align: center;
-        opacity: .6;
-        font-size: .8rem;
-        padding: 1rem 0;
+        .trust-line {
+            font-size: 0.74rem;
+        }
+
+        div[data-testid="stMetric"] {
+            min-height: 76px;
+        }
     }
     </style>
     """,
@@ -168,222 +281,241 @@ st.markdown(
 )
 
 
-# ============================================================
-# ============================================================
+# ============================================================================
 # HEADER
-# ============================================================
+# ============================================================================
+
+st.title("🔎 HybridRAG")
 
 st.markdown(
     """
-    <div class="hero">
-        <div class="hero-title">🔎 HybridRAG</div>
-        <div class="hero-subtitle">
-            Intelligent technical knowledge retrieval with hybrid search,
-            evidence-grounded generation, and citation validation.
-        </div>
-        <div class="trust-row">
-            <span class="badge">🧠 Semantic Search</span>
-            <span class="badge">🔤 BM25</span>
-            <span class="badge">🔀 Weighted RRF</span>
-            <span class="badge">📚 Evidence First</span>
-            <span class="badge">🔗 Citation Validation</span>
-            <span class="badge">🛡️ Grounded Answers</span>
-        </div>
+    <div class="app-subtitle">
+    Intelligent technical knowledge retrieval with hybrid search,
+    evidence-grounded generation, adaptive fusion, and citation validation.
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    """
+    <div class="trust-line">
+    🧠 Semantic Search &nbsp;•&nbsp;
+    🔤 BM25 &nbsp;•&nbsp;
+    🔀 Weighted RRF &nbsp;•&nbsp;
+    📚 Evidence First &nbsp;•&nbsp;
+    🔗 Citation Validation &nbsp;•&nbsp;
+    🛡️ Grounded Answers
     </div>
     """,
     unsafe_allow_html=True,
 )
 
 
-# ============================================================
+# ============================================================================
+# PIPELINE INITIALIZATION
+# ============================================================================
+
+@st.cache_resource(show_spinner="Initializing HybridRAG…")
+def get_pipeline() -> RAGPipeline:
+    """Initialize the expensive retrieval/generation stack once."""
+    return RAGPipeline()
+
+
+pipeline_error = None
+
+try:
+    pipeline = get_pipeline()
+except Exception as exc:
+    pipeline = None
+    pipeline_error = exc
+
+
+# ============================================================================
 # SIDEBAR
-# ============================================================
+# ============================================================================
 
 with st.sidebar:
     st.header("⚙️ System")
 
-    st.markdown("### Knowledge Base")
-    st.success("● Online • validated at pipeline startup")
+    if pipeline is not None:
+        st.success("HybridRAG ready")
+    else:
+        st.error("Backend unavailable")
+
+    st.subheader("Knowledge Base")
     st.write("**Corpus:** Python + FastAPI")
+    st.write("**Documents:** 696")
     st.write("**Chunks:** 18,150")
-    st.write("**Embeddings:** 384-D MiniLM")
-    st.write("**Index:** FAISS + BM25")
+    st.write("**Embeddings:** MiniLM · 384-D")
+    st.write("**Indexes:** FAISS + BM25")
 
-    st.markdown("### Retrieval")
-    st.write("Semantic candidates: **60**")
-    st.write("BM25 candidates: **60**")
-    st.write("Weights: **0.75 / 0.25**")
-    st.write("Fusion: **Weighted RRF (k=60)**")
+    st.subheader("Retrieval")
+    st.write("**Semantic candidates:** 60")
+    st.write("**BM25 candidates:** 60")
+    st.write("**Base weights:** 0.75 / 0.25")
+    st.write("**Fusion:** Weighted RRF · k=60")
+    st.write("**Adaptive fusion:** ON")
 
-    st.markdown("### Generation")
-    st.write("Model: **Gemini 3.6 Flash**")
-    st.write("Context window: **5 chunks**")
+    st.subheader("Generation")
+    st.write("**Model:** Gemini 3.6 Flash")
+    st.write("**Context:** 5 chunks")
 
-    st.markdown("### Guardrails")
+    st.subheader("Guardrails")
+    st.write("✓ Query validation")
+    st.write("✓ Evidence preservation")
     st.write("✓ Citation validation")
-    st.write("✓ Evidence inspection")
     st.write("✓ Groundedness evaluation")
-    st.write("✓ Pipeline error handling")
+    st.write("✓ Provider failure handling")
+    st.write("✓ Duplicate-query cache")
 
     st.divider()
-    st.caption("Tip: ask for an API, concept, behavior, parameter, or example from the indexed documentation.")
 
-# ============================================================
-# PIPELINE
-# ============================================================
+    st.subheader("Provider resilience")
 
-@st.cache_resource(show_spinner="Initializing HybridRAG…")
-def get_pipeline():
-    """
-    Initialize the complete RAG stack once per Streamlit process.
-    This prevents FAISS/BM25/model/knowledge-base initialization on
-    every Streamlit rerun.
-    """
-    return RAGPipeline()
+    last_result = st.session_state.last_result
+
+    if isinstance(last_result, dict) and not last_result.get("success", True):
+        if is_quota_error(last_result):
+            st.warning("Gemini quota/rate limit detected")
+            st.caption(
+                "No automatic retry loop is used. Repeated retries can "
+                "consume additional request quota."
+            )
+        elif is_retrieval_error(last_result):
+            st.error("Retrieval failure")
+        elif is_generation_error(last_result):
+            st.warning("Generation failure")
+        else:
+            st.warning("Pipeline failure")
+    else:
+        st.info("Provider status is checked when a query is executed.")
+
+    st.divider()
+
+    if st.button(
+        "🧹 Clear current answer",
+        use_container_width=True,
+        disabled=st.session_state.last_result is None,
+    ):
+        clear_current_result()
+        st.rerun()
+
+    if st.button(
+        "🗑️ Clear answer cache",
+        use_container_width=True,
+        disabled=not bool(st.session_state.answer_cache),
+    ):
+        st.session_state.answer_cache.clear()
+        st.toast("Answer cache cleared.")
+        st.rerun()
+
+    st.caption(
+        "Ask about APIs, concepts, parameters, exceptions, behavior, "
+        "or implementation details."
+    )
+    st.caption(f"UI v{APP_VERSION}")
 
 
-try:
-    pipeline = get_pipeline()
-    pipeline_ready = True
-except Exception as error:
-    pipeline_ready = False
-    st.error("Unable to initialize the RAG pipeline.")
-    st.exception(error)
+# ============================================================================
+# BACKEND FAILURE
+# ============================================================================
+
+if pipeline is None:
+    st.error(
+        "HybridRAG could not initialize the backend. "
+        "Verify the knowledge-base artifact, dependencies, and environment "
+        "configuration."
+    )
+
+    with st.expander("Initialization diagnostics"):
+        st.write(f"Exception type: `{type(pipeline_error).__name__}`")
+        st.write(
+            "Detailed exception text is intentionally hidden from the public "
+            "interface."
+        )
+
     st.stop()
 
 
-# PROJECT OVERVIEW
-# ============================================================
+# ============================================================================
+# ABOUT + ARCHITECTURE
+# ============================================================================
 
-with st.expander(
-    "📘 About This Project",
-    expanded=True,
-):
+with st.expander("📘 About HybridRAG", expanded=True):
+    st.markdown("### Technical Knowledge Retrieval & Question Answering")
 
-    st.markdown(
-        """
-        ### HybridRAG
-
-        HybridRAG combines **keyword-based retrieval** and
-        **semantic vector retrieval** to find relevant
-        technical documentation before passing the evidence
-        to a generative language model.
-
-        The objective is to improve:
-
-        - Retrieval quality
-        - Technical answer relevance
-        - Evidence traceability
-        - Hallucination resistance
-        - Source transparency
-        """
+    st.write(
+        "HybridRAG combines semantic vector retrieval and BM25 keyword "
+        "retrieval to find relevant technical evidence. Adaptive weighted "
+        "fusion combines the candidate lists. Selected evidence is passed "
+        "to the language model, and generated citations are checked against "
+        "the returned sources."
     )
 
-    st.markdown(
-        """
-        ### Architecture
-        """
+    render_metrics(
+        [
+            ("Retrieval", "Hybrid", "Semantic + BM25"),
+            ("Fusion", "RRF", "Weighted Reciprocal Rank Fusion"),
+            ("Generation", "Grounded", "Evidence-first context"),
+            ("Trust", "Validated", "Citation checking"),
+        ]
     )
 
-    st.markdown(
-        """
-        <div class="architecture">
+    st.markdown("### 🏗️ System Architecture")
 
-        User Query
-        <br>↓
-        <br>┌───────────────────────────────┐
-        <br>│ Semantic Retrieval            │
-        <br>│ SentenceTransformer + FAISS  │
-        <br>└───────────────────────────────┘
-        <br>↓
-        <br>┌───────────────────────────────┐
-        <br>│ Keyword Retrieval             │
-        <br>│ BM25                          │
-        <br>└───────────────────────────────┘
-        <br>↓
-        <br>Weighted Reciprocal Rank Fusion
-        <br>↓
-        <br>Top Evidence
-        <br>↓
-        <br>Gemini
-        <br>↓
-        <br>Answer + Citations
-        <br>↓
-        <br>Citation / Groundedness Validation
-
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    if ARCHITECTURE_IMAGE.is_file():
+        st.image(
+            str(ARCHITECTURE_IMAGE),
+            use_container_width=True,
+            caption=(
+                "HybridRAG: retrieve → fuse → select evidence → "
+                "generate → validate → answer."
+            ),
+        )
+    else:
+        st.warning(
+            "Architecture image not found. Expected: "
+            "`app/assets/hybridrag_architecture.png`"
+        )
 
 
-# ============================================================
+# ============================================================================
 # KNOWLEDGE BASE DASHBOARD
-# ============================================================
+# ============================================================================
 
-st.subheader("📊 Knowledge Base")
-
-col1, col2, col3, col4 = st.columns(4)
-
-col1.metric(
-    "Logical Documents",
-    "696",
+st.header("📊 Knowledge Base")
+st.caption(
+    "Indexed technical documentation and retrieval configuration."
 )
 
-col2.metric(
-    "Chunks",
-    "18,150",
+render_metrics(
+    [
+        ("Documents", "696", "Logical documents"),
+        ("Chunks", "18,150", "Indexed retrieval units"),
+        ("Embedding", "384-D", "MiniLM vector dimension"),
+        ("Technologies", "2", "Python + FastAPI"),
+    ]
 )
 
-col3.metric(
-    "Embedding Dimension",
-    "384",
-)
-
-col4.metric(
-    "Technologies",
-    "2",
-)
-
-
-kb1, kb2, kb3, kb4 = st.columns(4)
-
-kb1.metric(
-    "Python Documents",
-    "536",
-)
-
-kb2.metric(
-    "FastAPI Documents",
-    "160",
-)
-
-kb3.metric(
-    "Chunk Size",
-    "1,200 chars",
-)
-
-kb4.metric(
-    "Chunk Overlap",
-    "200 chars",
+render_metrics(
+    [
+        ("Python Docs", "536", "Indexed Python documents"),
+        ("FastAPI Docs", "160", "Indexed FastAPI documents"),
+        ("Chunk Size", "1,200", "Maximum characters"),
+        ("Overlap", "200", "Characters"),
+    ]
 )
 
 
-# ============================================================
-# RETRIEVAL BENCHMARK
-# ============================================================
+# ============================================================================
+# RETRIEVAL EVALUATION
+# ============================================================================
 
-with st.expander(
-    "📈 Retrieval Evaluation Results",
-    expanded=False,
-):
-
-    st.markdown(
-        """
-        The retrieval benchmark was evaluated using
-        **40 technical queries** with manually audited
-        relevant sources.
-        """
+with st.expander("📈 Retrieval Evaluation", expanded=False):
+    st.write(
+        "40 technical queries were evaluated using manually audited "
+        "relevant sources."
     )
 
     st.markdown(
@@ -397,28 +529,18 @@ with st.expander(
     )
 
     st.success(
-        """
-        **Key observation:** Hybrid retrieval provides
-        stronger deeper-rank recall than either individual
-        retrieval method, reaching **87.5% Hit@10** in the
-        candidate-depth experiment.
-        """
+        "Best measured hybrid configuration: 60 candidates per retriever, "
+        "87.5% Hit@10 and 0.489 MRR."
     )
 
-    st.caption(
-        "MRR = Mean Reciprocal Rank"
-    )
+    st.caption("MRR = Mean Reciprocal Rank")
 
 
-# ============================================================
+# ============================================================================
 # EXPERIMENTS
-# ============================================================
+# ============================================================================
 
-with st.expander(
-    "🧪 Retrieval Experiments",
-    expanded=False,
-):
-
+with st.expander("🧪 Retrieval Experiments", expanded=False):
     st.markdown("### Hybrid Weight Experiment")
 
     st.markdown(
@@ -435,63 +557,69 @@ with st.expander(
 
     st.markdown("### Reranking Experiment")
 
-    st.markdown(
-    """
-    A Cross-Encoder reranking stage was also evaluated.
-
-    The MS-MARCO reranker improved Hit@1 slightly,
-    but reduced deeper retrieval recall and overall MRR.
-    Therefore it is retained as an experiment rather
-    than being used as the primary production ranking stage.
-    """
-)
+    st.write(
+        "A Cross-Encoder MS-MARCO reranker was evaluated. It improved "
+        "Hit@1 slightly but reduced deeper retrieval recall and overall "
+        "MRR. It therefore remains an experiment rather than the primary "
+        "ranking stage."
+    )
 
     st.warning(
-        "Reranking was intentionally not selected as the primary ranking stage because it reduced MRR."
+        "Primary retrieval uses hybrid retrieval without the cross-encoder reranker."
     )
 
 
-# ============================================================
-# EXAMPLE QUESTIONS
-# ============================================================
+# ============================================================================
+# SEARCH
+# ============================================================================
 
-st.subheader("💬 Ask the Technical Knowledge Base")
+st.header("💬 Ask the Technical Knowledge Base")
 
-examples = [
-    "How do I create dependencies in FastAPI?",
-    "How does Python handle exceptions?",
-    "How can I validate data received by an API?",
-    "What is RequestValidationError in FastAPI?",
-    "How does Python's yield keyword work?",
-]
-
-selected_example = st.selectbox(
-    "Example questions",
-    ["Custom question"] + examples,
+st.caption(
+    "Run the complete HybridRAG retrieval → generation → validation pipeline."
 )
 
-if selected_example != "Custom question":
+with st.expander("ℹ️ How a search is processed", expanded=False):
+    st.markdown(
+        """
+        **1.** Normalize and validate the question.  
+        **2.** Run semantic retrieval with MiniLM + FAISS.  
+        **3.** Run BM25 keyword retrieval.  
+        **4.** Apply adaptive weighted Reciprocal Rank Fusion.  
+        **5.** Select the best evidence chunks.  
+        **6.** Generate only from the selected evidence.  
+        **7.** Validate citations against returned sources.  
+        **8.** If Gemini is rate-limited, do **not** display an invented answer.
+        """
+    )
 
-    default_query = selected_example
+selected_example = st.selectbox(
+    "Quick start",
+    ["Custom question", *EXAMPLES],
+)
 
-else:
-
-    default_query = ""
-
+default_query = "" if selected_example == "Custom question" else selected_example
 
 query = st.text_area(
-    "Enter your technical question",
+    "Technical question",
     value=default_query,
-    height=90,
-    placeholder=(
-        "Example: How do dependencies work in FastAPI?"
+    height=120,
+    max_chars=MAX_QUERY_LENGTH,
+    placeholder="Example: How do dependencies work in FastAPI?",
+    help=(
+        "Ask about a concept, API, parameter, exception, behavior, "
+        "or implementation detail."
     ),
 )
 
+c1, c2 = st.columns(2)
 
-# ============================================================
-# ASK BUTTON
-# ============================================================
+with c1:
+    st.caption("💡 Focused questions generally produce clearer evidence.")
+
+with c2:
+    st.caption("🔎 Semantic + keyword retrieval is used together.")
+
 
 ask_clicked = st.button(
     "🚀 Ask HybridRAG",
@@ -499,219 +627,622 @@ ask_clicked = st.button(
     use_container_width=True,
 )
 
-# Keep the last successful answer available across Streamlit reruns.
-if "last_result" not in st.session_state:
-    st.session_state.last_result = None
-if "last_query" not in st.session_state:
-    st.session_state.last_query = ""
 
-# ============================================================
+# ============================================================================
 # EXECUTION
-# ============================================================
+# ============================================================================
 
 if ask_clicked:
-    if not query.strip():
+    cleaned_query = normalize_query(query)
+
+    if not cleaned_query:
         st.warning("Please enter a technical question.")
         st.stop()
 
-    query = query.strip()
-
-    if len(query) < 3:
+    if len(cleaned_query) < 3:
         st.warning("Please provide a more descriptive question.")
         st.stop()
 
-    if len(query) > 2000:
-        st.warning("Please keep the question under 2,000 characters.")
+    if len(cleaned_query) > MAX_QUERY_LENGTH:
+        st.warning(
+            f"Please keep the question under {MAX_QUERY_LENGTH:,} characters."
+        )
         st.stop()
 
-    with st.spinner("🔎 Retrieving evidence → validating context → generating answer…"):
-        try:
-            start_time = time.perf_counter()
-            result = pipeline.ask(query)
-            elapsed = time.perf_counter() - start_time
-            st.session_state.last_result = result
-            st.session_state.last_query = query
-        except Exception as error:
-            st.error("The RAG pipeline encountered an error.")
-            st.exception(error)
+    # ------------------------------------------------------------
+    # SESSION CACHE
+    # ------------------------------------------------------------
+    cached = get_cached_result(cleaned_query)
+
+    if cached is not None:
+        st.session_state.last_result = cached
+        st.session_state.last_query = cleaned_query
+        st.session_state.last_status = "cached"
+        st.toast("Loaded the successful answer from the session cache.")
+        st.rerun()
+
+    # ------------------------------------------------------------
+    # LIVE PIPELINE
+    # ------------------------------------------------------------
+    try:
+        with st.spinner(
+            "🔎 Retrieving evidence → selecting context → generating answer…"
+        ):
+            result = pipeline.ask(cleaned_query)
+
+        if not isinstance(result, dict):
+            st.error("The backend returned an unexpected response.")
             st.stop()
 
-# ============================================================
-# RESULT
-# ============================================================
+        st.session_state.last_result = result
+        st.session_state.last_query = cleaned_query
+
+        if result.get("success", False):
+            st.session_state.last_status = "success"
+            cache_successful_result(cleaned_query, result)
+        elif is_quota_error(result):
+            st.session_state.last_status = "quota"
+        elif is_retrieval_error(result):
+            st.session_state.last_status = "retrieval_error"
+        else:
+            st.session_state.last_status = "error"
+
+    except Exception:
+        st.session_state.last_status = "exception"
+        st.error(
+            "The request could not be completed. "
+            "No unreliable answer was displayed."
+        )
+        st.stop()
+
+
+# ============================================================================
+# RETRY LAST QUERY
+# ============================================================================
 
 result = st.session_state.last_result
 
-if result:
-    query_display = st.session_state.last_query
+if isinstance(result, dict) and not result.get("success", True):
+    if st.session_state.last_query:
+        st.divider()
+        st.subheader("🔁 Recovery")
 
+        if is_quota_error(result):
+            st.warning(
+                "Gemini is currently rate-limited or out of quota. "
+                "Automatic retry loops are intentionally disabled."
+            )
+
+            st.caption(
+                "If you have upgraded the Gemini project or the quota has "
+                "reset, retry this exact question."
+            )
+
+        elif is_retrieval_error(result):
+            st.warning(
+                "The retrieval stage failed. A single manual retry is available."
+            )
+
+        elif is_generation_error(result):
+            st.warning(
+                "The generation stage failed. A single manual retry is available."
+            )
+
+        retry_col, cache_col = st.columns(2)
+
+        with retry_col:
+            retry_clicked = st.button(
+                "🔄 Retry last query",
+                type="secondary",
+                use_container_width=True,
+            )
+
+        with cache_col:
+            cached_previous = get_cached_result(st.session_state.last_query)
+
+            use_cache_clicked = st.button(
+                "📦 Use cached answer",
+                use_container_width=True,
+                disabled=cached_previous is None,
+            )
+
+        if use_cache_clicked and cached_previous is not None:
+            st.session_state.last_result = cached_previous
+            st.session_state.last_status = "cached"
+            st.rerun()
+
+        if retry_clicked:
+            retry_query = st.session_state.last_query
+
+            try:
+                with st.spinner("🔄 Retrying HybridRAG once…"):
+                    retry_result = pipeline.ask(retry_query)
+
+                if isinstance(retry_result, dict):
+                    st.session_state.last_result = retry_result
+
+                    if retry_result.get("success", False):
+                        st.session_state.last_status = "success"
+                        cache_successful_result(
+                            retry_query,
+                            retry_result,
+                        )
+                    elif is_quota_error(retry_result):
+                        st.session_state.last_status = "quota"
+                    else:
+                        st.session_state.last_status = "error"
+
+                    st.rerun()
+
+                st.error("The backend returned an unexpected retry response.")
+
+            except Exception:
+                st.error(
+                    "The retry failed. No unreliable answer was displayed."
+                )
+
+
+# ============================================================================
+# RESULT
+# ============================================================================
+
+result = st.session_state.last_result
+
+if isinstance(result, dict):
     st.divider()
 
-    st.markdown(
-        f'<div class="small-muted">QUESTION</div><h3>{query_display}</h3>',
-        unsafe_allow_html=True,
-    )
+    st.subheader("🔍 Question")
+    st.info(st.session_state.last_query)
 
-    answer = result.get("answer", "")
-    sources = result.get("sources", [])
-    citation_result = validate_citations(answer, sources)
+    if st.session_state.last_status == "cached":
+        st.caption("📦 Served from the current Streamlit session cache.")
 
-    # Trust summary
-    st.markdown("### 🛡️ Answer quality")
-    t1, t2, t3, t4 = st.columns(4)
+    success = bool(result.get("success", True))
+    answerable = bool(result.get("answerable", True))
 
-    t1.metric(
-        "Evidence chunks",
-        result.get("context_chunks", len(sources))
-    )
-    t2.metric(
-        "Valid citations",
-        len(citation_result.get("valid_citations", []))
-    )
-    t3.metric(
-        "Invalid citations",
-        len(citation_result.get("invalid_citations", []))
-    )
-    t4.metric(
-        "Retrieved candidates",
-        len(result.get(
-            "retrieved_results",
-            result.get("hybrid_results", [])
-        ))
-    )
+    # ========================================================================
+    # FAILURE STATE
+    # ========================================================================
 
-    if citation_result.get("all_citations_valid", False):
-        st.success("✓ All generated citations map to returned evidence.")
-    elif citation_result.get("has_citations", False):
-        st.warning("Some citations could not be matched to returned evidence.")
+    if not success:
+        error_type = str(result.get("error_type") or "").lower()
+
+        if is_quota_error(result):
+            st.error("⚠️ Gemini generation is temporarily unavailable")
+
+            st.info(
+                "The retrieval pipeline reached the language-model generation "
+                "stage, but Gemini rejected the generation request because the "
+                "project is rate-limited or its current quota is exhausted."
+            )
+
+            st.markdown(
+                """
+                **What this means**
+
+                - Your HybridRAG retrieval/indexing system is separate from Gemini.
+                - The UI will not fabricate an answer when generation fails.
+                - Automatic retry loops are disabled to avoid repeatedly consuming quota.
+                - After the quota becomes available or billing/rate limits are upgraded,
+                  use **Retry last query** above.
+                """
+            )
+
+            st.caption(
+                "This is a provider quota/rate-limit condition, not evidence that "
+                "the retrieved documentation is incorrect."
+            )
+
+        elif is_retrieval_error(result):
+            st.error("⚠️ Retrieval could not be completed")
+
+            st.info(
+                "HybridRAG could not retrieve the required evidence from the "
+                "knowledge base. No generated answer was displayed."
+            )
+
+        elif is_generation_error(result):
+            st.error("⚠️ Answer generation could not be completed")
+
+            st.info(
+                "The language-model generation stage failed. "
+                "No unsupported answer was displayed."
+            )
+
+        else:
+            st.error("⚠️ HybridRAG could not complete this request")
+
+            st.info(
+                "The pipeline encountered an internal problem. "
+                "No unreliable answer was displayed."
+            )
+
+        st.subheader("🛡️ Safety behavior")
+
+        render_metrics(
+            [
+                ("Answer", "Blocked", "No unreliable answer displayed"),
+                ("Provider", "Failed", "Generation provider did not respond successfully"),
+                ("Guardrail", "Active", "Failure propagated safely"),
+            ]
+        )
+
+    # ========================================================================
+    # NOT ANSWERABLE
+    # ========================================================================
+
+    elif not answerable:
+        st.warning(
+            "The knowledge base did not contain enough relevant evidence "
+            "to answer this question reliably."
+        )
+
+        st.info(
+            "Try a more specific question about Python or FastAPI, "
+            "for example a named API, parameter, exception, or behavior."
+        )
+
+    # ========================================================================
+    # SUCCESS
+    # ========================================================================
+
     else:
-        st.warning("No source citations were detected in the generated answer.")
+        answer = str(result.get("answer") or "")
+        sources = result.get("sources", [])
 
-    # Answer
-    st.markdown("### 🧠 Answer")
-    with st.container():
-        st.markdown('<div class="answer-card">', unsafe_allow_html=True)
+        if not isinstance(sources, list):
+            sources = []
+
+        # --------------------------------------------------------------------
+        # CITATION VALIDATION
+        # --------------------------------------------------------------------
+
+        try:
+            citation_result = validate_citations(
+                answer=answer,
+                sources=sources,
+            )
+        except Exception:
+            citation_result = {
+                "has_citations": False,
+                "all_citations_valid": False,
+                "valid_citations": [],
+                "invalid_citations": [],
+            }
+
+        valid_citations = citation_result.get(
+            "valid_citations",
+            [],
+        )
+
+        invalid_citations = citation_result.get(
+            "invalid_citations",
+            [],
+        )
+
+        if not isinstance(valid_citations, list):
+            valid_citations = []
+
+        if not isinstance(invalid_citations, list):
+            invalid_citations = []
+
+        all_valid = bool(
+            citation_result.get(
+                "all_citations_valid",
+                False,
+            )
+        )
+
+        has_citations = bool(
+            citation_result.get(
+                "has_citations",
+                False,
+            )
+        )
+
+        # --------------------------------------------------------------------
+        # ANSWER QUALITY
+        # --------------------------------------------------------------------
+
+        st.subheader("🛡️ Answer Quality")
+
+        render_metrics(
+            [
+                (
+                    "Evidence",
+                    str(
+                        safe_int(
+                            result.get("context_chunks"),
+                            len(sources),
+                        )
+                    ),
+                    "Selected context chunks",
+                ),
+                (
+                    "Valid Citations",
+                    str(len(valid_citations)),
+                    "Citations matched to evidence",
+                ),
+                (
+                    "Invalid Citations",
+                    str(len(invalid_citations)),
+                    "Citations not matched to evidence",
+                ),
+                (
+                    "Candidates",
+                    str(
+                        safe_int(
+                            result.get("retrieved_candidates"),
+                            0,
+                        )
+                    ),
+                    "Hybrid retrieval candidates",
+                ),
+            ]
+        )
+
+        if all_valid:
+            st.success(
+                "✓ All generated citations map to returned evidence."
+            )
+        elif has_citations:
+            st.warning(
+                "Some generated citations could not be matched to returned evidence."
+            )
+        else:
+            st.warning(
+                "No source citations were detected in the generated answer."
+            )
+
+        # --------------------------------------------------------------------
+        # ANSWER
+        # --------------------------------------------------------------------
+
+        st.subheader("🧠 Answer")
+
         if answer:
             st.markdown(answer)
         else:
             st.warning("No answer was generated.")
-        st.markdown("</div>", unsafe_allow_html=True)
 
-    # Performance
-    st.markdown("### ⚡ Performance")
-    retrieval_latency = result.get("retrieval_latency_ms", 0)
-    generation_latency = result.get("generation_latency_ms", 0)
-    total_latency = result.get("total_latency_ms", 0)
+        # --------------------------------------------------------------------
+        # PERFORMANCE
+        # --------------------------------------------------------------------
 
-    p1, p2, p3, p4 = st.columns(4)
-    p1.metric("Retrieval", f"{retrieval_latency:.0f} ms")
-    p2.metric("Generation", f"{generation_latency / 1000:.1f} s")
-    p3.metric("Total", f"{total_latency / 1000:.1f} s")
-    p4.metric(
-        "Sources",
-        len(sources)
-    )
+        st.subheader("⚡ Performance")
 
-    # Evidence + diagnostics tabs
-    tab_sources, tab_retrieval, tab_raw = st.tabs(
-        ["📚 Evidence & Sources", "🔬 Retrieval Diagnostics", "🧩 Raw Result"]
-    )
+        render_metrics(
+            [
+                (
+                    "Retrieval",
+                    ms(result.get("retrieval_latency_ms")),
+                    "Search + fusion",
+                ),
+                (
+                    "Generation",
+                    seconds(result.get("generation_latency_ms")),
+                    "LLM generation",
+                ),
+                (
+                    "Total",
+                    seconds(result.get("total_latency_ms")),
+                    "End-to-end pipeline",
+                ),
+                (
+                    "Sources",
+                    str(len(sources)),
+                    "Returned evidence sources",
+                ),
+            ]
+        )
 
-    with tab_sources:
-        if not sources:
-            st.info("No source metadata returned.")
-        else:
-            for index, source in enumerate(sources, start=1):
-                technology = source.get("technology", "unknown")
-                source_name = source.get("source", "unknown")
-                section = source.get("section", "General")
-                score = source.get(
-                    "rrf_score",
-                    source.get("score", 0)
-                )
-                page = source.get("page")
-                sheet = source.get("sheet")
-                slide = source.get("slide")
+        # --------------------------------------------------------------------
+        # DETAILS
+        # --------------------------------------------------------------------
 
-                location = []
-                if page is not None:
-                    location.append(f"Page {page}")
-                if sheet:
-                    location.append(f"Sheet: {sheet}")
-                if slide is not None:
-                    location.append(f"Slide {slide}")
+        tab_sources, tab_diagnostics, tab_raw = st.tabs(
+            [
+                "📚 Evidence & Sources",
+                "🔬 Retrieval Diagnostics",
+                "🧩 Raw Result",
+            ]
+        )
 
-                title = f"[SOURCE {index}] {source_name}"
-                with st.expander(title, expanded=(index == 1)):
-                    m1, m2, m3 = st.columns(3)
-                    m1.write(f"**Technology**  \\n{technology}")
-                    m2.write(f"**Section**  \\n{section}")
-                    m3.write(f"**RRF score**  \\n{score:.6f}")
+        # ====================================================================
+        # EVIDENCE
+        # ====================================================================
 
-                    if location:
-                        st.caption(" · ".join(location))
+        with tab_sources:
+            if not sources:
+                st.info("No source metadata was returned.")
+            else:
+                for index, source in enumerate(
+                    sources,
+                    start=1,
+                ):
+                    if not isinstance(source, dict):
+                        continue
 
-                    source_text = source.get("text", "")
-                    if source_text:
-                        st.markdown("**Retrieved evidence**")
-                        st.code(source_text, language="text")
+                    source_name = source.get(
+                        "source",
+                        "unknown",
+                    )
 
-    with tab_retrieval:
-        semantic_results = result.get("semantic_results", [])
-        bm25_results = result.get("bm25_results", [])
-        hybrid_results = result.get("hybrid_results", [])
+                    technology = source.get(
+                        "technology",
+                        "unknown",
+                    )
 
-        r1, r2, r3 = st.columns(3)
-        r1.metric("Semantic", len(semantic_results))
-        r2.metric("BM25", len(bm25_results))
-        r3.metric("Hybrid", len(hybrid_results))
+                    section = source.get(
+                        "section",
+                        "General",
+                    )
 
-        st.markdown("#### Top semantic results")
-        for item in semantic_results[:5]:
-            st.write(
-                f"**Rank {item.get('rank', '?')}** · "
-                f"Score `{item.get('score', 0):.4f}` · "
-                f"{item.get('metadata', {}).get('source', 'unknown')}"
+                    score = safe_float(
+                        source.get(
+                            "score",
+                            source.get(
+                                "rrf_score",
+                                0,
+                            ),
+                        )
+                    )
+
+                    location = source_location(source)
+
+                    with st.expander(
+                        f"[SOURCE {index}] {source_name}",
+                        expanded=(index == 1),
+                    ):
+                        c1, c2, c3 = st.columns(3)
+
+                        with c1:
+                            st.write("**Technology**")
+                            st.write(str(technology))
+
+                        with c2:
+                            st.write("**Section**")
+                            st.write(str(section))
+
+                        with c3:
+                            st.write("**Relevance**")
+                            st.write(f"{score:.6f}")
+
+                        if location:
+                            st.caption(location)
+
+                        source_text = source.get(
+                            "text",
+                            "",
+                        )
+
+                        if source_text:
+                            st.markdown("**Retrieved evidence**")
+                            st.code(
+                                str(source_text),
+                                language="text",
+                            )
+
+        # ====================================================================
+        # RETRIEVAL DIAGNOSTICS
+        # ====================================================================
+
+        with tab_diagnostics:
+            semantic_count = safe_int(
+                result.get("semantic_candidates"),
+                0,
             )
 
-        st.markdown("#### Top BM25 results")
-        for item in bm25_results[:5]:
-            st.write(
-                f"**Rank {item.get('rank', '?')}** · "
-                f"Score `{item.get('score', 0):.4f}` · "
-                f"{item.get('metadata', {}).get('source', 'unknown')}"
+            bm25_count = safe_int(
+                result.get("bm25_candidates"),
+                0,
             )
 
-        st.markdown("#### Top hybrid results")
-        for item in hybrid_results[:10]:
-            st.write(
-                f"**Rank {item.get('rank', '?')}** · "
-                f"RRF `{item.get('rrf_score', 0):.6f}` · "
-                f"{item.get('metadata', {}).get('source', 'unknown')}"
+            hybrid_count = safe_int(
+                result.get("retrieved_candidates"),
+                0,
             )
 
-    with tab_raw:
-        st.json(result)
+            context_count = safe_int(
+                result.get("context_chunks"),
+                len(sources),
+            )
 
-# ============================================================
+            render_metrics(
+                [
+                    (
+                        "Semantic",
+                        str(semantic_count),
+                        "Semantic candidate count",
+                    ),
+                    (
+                        "BM25",
+                        str(bm25_count),
+                        "Keyword candidate count",
+                    ),
+                    (
+                        "Hybrid",
+                        str(hybrid_count),
+                        "Fused candidate count",
+                    ),
+                    (
+                        "Context",
+                        str(context_count),
+                        "Selected evidence chunks",
+                    ),
+                ]
+            )
+
+            st.markdown("#### Retrieval flow")
+
+            st.code(
+                """User Query
+     │
+     ├── Semantic Search → MiniLM → FAISS
+     │
+     └── BM25 Keyword Search
+              │
+              ▼
+       Adaptive Weighted RRF
+              │
+              ▼
+       Candidate Deduplication
+              │
+              ▼
+       Top-K Evidence / Context
+              │
+              ▼
+       Gemini 3.6 Flash
+              │
+              ▼
+       Citation Validation
+              │
+              ▼
+       Grounded Answer + Sources""",
+                language="text",
+            )
+
+            diagnostics = {}
+
+            for key in (
+                "query_profile",
+                "fusion_weights",
+                "retrieval_config",
+                "semantic_candidates",
+                "bm25_candidates",
+                "retrieved_candidates",
+                "context_chunks",
+            ):
+                if key in result:
+                    diagnostics[key] = result[key]
+
+            if diagnostics:
+                st.markdown("#### Returned diagnostics")
+                st.json(diagnostics)
+
+            st.caption(
+                "Only diagnostics actually returned by the backend are shown. "
+                "The UI does not reconstruct or invent ranked candidate lists."
+            )
+
+        # ====================================================================
+        # RAW RESULT
+        # ====================================================================
+
+        with tab_raw:
+            st.caption(
+                "Developer-facing structured response returned by the pipeline."
+            )
+            st.json(result)
+
+
+# ============================================================================
 # FOOTER
-# ============================================================
-
-st.divider()
-st.markdown(
-    '<div class="footer">HybridRAG • Hybrid Retrieval + Retrieval-Augmented Generation • Evidence-first technical QA</div>',
-    unsafe_allow_html=True,
-)
-
-
-# FOOTER
-# ============================================================
+# ============================================================================
 
 st.divider()
 
 st.caption(
-    """
-    HybridRAG • Hybrid Retrieval + Retrieval-Augmented Generation
-    • Built for technical documentation
-    """
+    "HybridRAG · Hybrid Retrieval + Retrieval-Augmented Generation "
+    "· Evidence-first technical QA · UI v2.0"
 )
