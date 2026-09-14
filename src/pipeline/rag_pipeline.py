@@ -5,7 +5,7 @@ Pipeline:
 
     Query
       ↓
-    Knowledge-Base Validation
+    Knowledge-Base Bootstrap + Validation
       ↓
     Hybrid Retrieval
       ├── Semantic Search
@@ -56,6 +56,7 @@ if str(PROJECT_ROOT) not in sys.path:
 # ============================================================
 
 from src.deployment.artifact_loader import (
+    ensure_knowledge_base,
     validate_knowledge_base,
 )
 
@@ -164,16 +165,43 @@ class RAGPipeline:
         print("=" * 80)
 
         # ----------------------------------------------------
-        # 0. Knowledge-base validation
+        # 0. Knowledge-base bootstrap + validation
+        # ----------------------------------------------------
+        #
+        # IMPORTANT:
+        # A deployment environment starts without generated
+        # RAG files because data/processed/ and vectorstore/
+        # are intentionally excluded from Git.
+        #
+        # ensure_knowledge_base() handles both cases:
+        #   1. KB exists locally -> validate/reuse it.
+        #   2. KB is missing -> download the verified release
+        #      artifact, extract it safely, then validate it.
+        #
+        # validate_knowledge_base() alone is NOT sufficient for
+        # Streamlit Cloud because a fresh machine has no KB yet.
         # ----------------------------------------------------
 
-        print("\n[0/2] Validating knowledge base...")
+        print("\n[0/2] Preparing knowledge base...")
 
         validation_start = time.perf_counter()
 
-        self.knowledge_base_info = (
-            validate_knowledge_base()
-        )
+        try:
+            # Bootstrap first. This is safe to call even when the
+            # knowledge base already exists locally.
+            ensure_knowledge_base()
+
+            # Validate the actual files after bootstrap/reuse.
+            self.knowledge_base_info = validate_knowledge_base()
+
+        except Exception as error:
+            print(
+                "\n[ERROR] Knowledge-base initialization failed:"
+            )
+            print(
+                f"  {type(error).__name__}: {error}"
+            )
+            raise
 
         validation_latency = (
             time.perf_counter() - validation_start
@@ -185,12 +213,12 @@ class RAGPipeline:
         )
 
         print(
-            f"[OK] Knowledge base validated: "
+            f"[OK] Knowledge base ready: "
             f"{self.knowledge_base_info['chunks']:,} chunks"
         )
 
         print(
-            f"[OK] Validation latency: "
+            f"[OK] Knowledge-base bootstrap/validation latency: "
             f"{self.knowledge_base_validation_latency_ms:.2f} ms"
         )
 
